@@ -1,0 +1,44 @@
+# <PROJECT NAME>
+
+<One paragraph: what this system is, who it serves, what "done" means.>
+
+## Spec status tags
+
+Statements tagged [LOCKED] are settled decisions — do not revisit without the
+owner explicitly unlocking. [DEFAULT] = current choice, changeable with a
+stated reason. [OPEN] = undecided. [VERIFY] = confirm before relying on it.
+
+## Locked specs
+
+- [LOCKED] <non-negotiable #1 — e.g. "all monetary amounts are Decimal">
+- [LOCKED] <non-negotiable #2 — e.g. "no live API keys; testnet/read-only only">
+- [DEFAULT] <current choice worth writing down>
+- [OPEN] <known undecided question>
+
+## Build order
+
+- Phase 1 — <slice>: <definition of done>
+- Phase 2 — <slice>: <definition of done>
+
+## Deliberate deferrals
+
+Chosen tradeoffs, recorded so a cold reviewer reads them as decisions, not
+oversights. For each: what was deferred, where it lands instead, and why not
+now.
+
+- <deferral #1 — e.g. "retry/backoff on transient errors -> the scheduler
+  phase; the adapter just raises a typed error">
+
+## Working agreements
+
+- Tests first for any new behavior; extend the suite before the feature.
+- Plan mode for any change touching more than one file. Wait for approval.
+- Small commits, one logical change each. Never commit on red tests — the
+  hooks enforce this; do not disable them.
+- If a [LOCKED] spec blocks a task, stop and say so rather than work around it.
+
+## Commands
+
+- Test: `uv run pytest -q`
+- Lint: `uv run ruff check .` / format: `uv run ruff format .`
+- Types: `uv run mypy`

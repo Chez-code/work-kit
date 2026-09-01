@@ -1,0 +1,23 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # Pin to your project's requires-python floor — CI should verify the
+      # minimum version you claim to support, not whatever is newest.
+      - run: uv python install 3.12
+      # Bare `uv sync` skips optional extras, so tests importing an extra
+      # silently fail to collect while CI reports green. --all-extras is the
+      # safe template default; projects with no extras are unaffected.
+      - run: uv sync --all-extras
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - run: uv run pytest -q
