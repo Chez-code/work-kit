@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Verification gate for Claude Code hooks. Stdlib only.
 
-PostToolUse (Write|Edit|MultiEdit): ruff-fix the touched file, then fast tests.
-Stop (--stop): full test suite before Claude is allowed to declare victory.
+Auto-detects the stack:
+- Python (pyproject.toml): PostToolUse ruff-fixes the touched .py file and runs
+  fast tests; Stop runs the full suite.
+- .NET (.sln/.csproj): PostToolUse builds after each .cs edit (tests are too
+  slow mid-session); Stop builds and runs the full test suite.
 
 Exit 0  -> proceed.
 Exit 2  -> blocked; stderr is fed back to Claude so it fixes its own mess.
@@ -17,6 +20,14 @@ import sys
 from pathlib import Path
 
 MAX_LINES = 40  # keep feedback concise — Claude needs the failure, not the novel
+
+
+def is_dotnet(root: Path) -> bool:
+    """A solution or project file at (or one level under) the root marks a .NET repo."""
+    for pattern in ("*.sln", "*.csproj", "*/*.csproj"):
+        if any(root.glob(pattern)):
+            return True
+    return False
 
 
 def uv_available(root: Path) -> bool:
@@ -48,38 +59,54 @@ def main() -> int:
 
     failures: list[str] = []
 
-    if not stop_mode:
-        file_path = (payload.get("tool_input") or {}).get("file_path", "")
-        if not file_path.endswith(".py"):
-            return 0  # only gate Python edits
-        if uv_available(root):
-            ruff_cmd = ["uv", "run", "ruff"]
-        else:
-            ruff_cmd = ["ruff"] if shutil.which("ruff") else []
-        if ruff_cmd:
-            code, out = sh([*ruff_cmd, "check", "--fix", file_path], root)
+    if is_dotnet(root):
+        if not shutil.which("dotnet"):
+            sys.stderr.write("[gate] .NET repo but no dotnet on PATH — skipping\n")
+            return 0
+        if not stop_mode:
+            file_path = (payload.get("tool_input") or {}).get("file_path", "")
+            if not file_path.endswith((".cs", ".csproj", ".sln")):
+                return 0
+        code, out = sh(["dotnet", "build", "--nologo", "-v", "q"], root)
+        if code != 0:
+            failures.append(f"dotnet build:\n{out}")
+        elif stop_mode:
+            code, out = sh(["dotnet", "test", "--nologo", "-v", "q"], root)
             if code != 0:
-                failures.append(f"ruff:\n{out}")
+                failures.append(f"dotnet test:\n{out}")
+    else:
+        if not stop_mode:
+            file_path = (payload.get("tool_input") or {}).get("file_path", "")
+            if not file_path.endswith(".py"):
+                return 0  # only gate Python edits
+            if uv_available(root):
+                ruff_cmd = ["uv", "run", "ruff"]
+            else:
+                ruff_cmd = ["ruff"] if shutil.which("ruff") else []
+            if ruff_cmd:
+                code, out = sh([*ruff_cmd, "check", "--fix", file_path], root)
+                if code != 0:
+                    failures.append(f"ruff:\n{out}")
 
-    if (root / "tests").is_dir():
-        # Mirror the ruff branch: prefer the uv-managed venv, fall back to a
-        # pytest on PATH, and if neither exists degrade to a clean skip rather
-        # than shelling `python3 -m pytest` — which on a uv-only machine either
-        # errors confusingly or runs the wrong global pytest.
-        if uv_available(root):
-            pytest_cmd = ["uv", "run", "pytest", "-q"]
-        elif shutil.which("pytest"):
-            pytest_cmd = ["pytest", "-q"]
-        else:
-            pytest_cmd = []
-        if pytest_cmd:
-            if not stop_mode:
-                pytest_cmd.append("-x")  # fail fast mid-session; full run at Stop
-            code, out = sh(pytest_cmd, root)
-            if code != 0:
-                failures.append(f"pytest:\n{out}")
-        else:
-            sys.stderr.write("[gate] no pytest runner (uv or pytest) found — skipping tests\n")
+        if (root / "tests").is_dir():
+            # Mirror the ruff branch: prefer the uv-managed venv, fall back to a
+            # pytest on PATH, and if neither exists degrade to a clean skip rather
+            # than shelling `python3 -m pytest` — which on a uv-only machine either
+            # errors confusingly or runs the wrong global pytest.
+            if uv_available(root):
+                pytest_cmd = ["uv", "run", "pytest", "-q"]
+            elif shutil.which("pytest"):
+                pytest_cmd = ["pytest", "-q"]
+            else:
+                pytest_cmd = []
+            if pytest_cmd:
+                if not stop_mode:
+                    pytest_cmd.append("-x")  # fail fast mid-session; full run at Stop
+                code, out = sh(pytest_cmd, root)
+                if code != 0:
+                    failures.append(f"pytest:\n{out}")
+            else:
+                sys.stderr.write("[gate] no pytest runner (uv or pytest) found — skipping tests\n")
 
     if failures:
         label = "STOP GATE" if stop_mode else "EDIT GATE"

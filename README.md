@@ -44,10 +44,12 @@ cd /path/to/repo
 
 ## Adapting to your stack
 
-`gate.py` and the templates assume a Python project managed with uv
-(ruff/pytest/mypy). For another stack, swap the commands in `gate.py`,
-`.pre-commit-config.yaml`, and `ci.yml` — the hook wiring in
-`settings.json` is stack-agnostic.
+`gate.py` auto-detects the stack: a `pyproject.toml` repo gets ruff + pytest
+(uv-managed venv preferred); a `.sln`/`.csproj` repo gets `dotnet build` after
+each edit and `dotnet build` + `dotnet test` at Stop. For any other stack, swap
+the commands in `gate.py` — the hook wiring in `settings.json` is
+stack-agnostic. `.pre-commit-config.yaml` and `ci.yml` are Python-specific
+templates; translate or skip them elsewhere.
 
 In a shared repo, consider putting the hooks block in
 `.claude/settings.local.json` (untracked) rather than committing
