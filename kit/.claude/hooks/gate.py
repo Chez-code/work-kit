@@ -131,6 +131,12 @@ def main() -> int:
     failures: list[str] = []
 
     if is_dotnet(root):
+        if not stop_mode:
+            # Extension check FIRST: a non-code edit must return silently, like
+            # the Python lane — never emit the skip systemMessage for a README.
+            file_path = (payload.get("tool_input") or {}).get("file_path", "")
+            if not file_path.endswith((".cs", ".csproj", ".sln", ".slnx")):
+                return 0
         if not shutil.which("dotnet"):
             return skip_visibly("[gate] .NET repo but no dotnet on PATH — gate is NOT running")
         target, reason = find_dotnet_target(root)
@@ -138,10 +144,6 @@ def main() -> int:
             return skip_visibly(
                 f"[gate] .NET gate skipped ({reason}) — no verification is running. {DOTNET_HINT}"
             )
-        if not stop_mode:
-            file_path = (payload.get("tool_input") or {}).get("file_path", "")
-            if not file_path.endswith((".cs", ".csproj", ".sln", ".slnx")):
-                return 0
         code, out = sh(["dotnet", "build", target, "--nologo", "-v", "q"], root, deadline)
         if code != 0:
             failures.append(f"dotnet build:\n{out}")

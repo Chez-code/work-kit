@@ -20,9 +20,9 @@ Version note: the default kit needs nothing newer than basic hook support
 ```bash
 git clone https://github.com/Chez-code/work-kit ~/work-kit
 
-# tmux (optional)
-cp ~/work-kit/tmux.conf ~/.tmux.conf
-git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
+# tmux (optional — only if you do not already have a ~/.tmux.conf)
+[ -f ~/.tmux.conf ] || cp ~/work-kit/tmux.conf ~/.tmux.conf
+[ -d ~/.tmux/plugins/tpm ] || git clone https://github.com/tmux-plugins/tpm ~/.tmux/plugins/tpm
 
 # harness into a repo
 ~/work-kit/bootstrap.sh /path/to/repo

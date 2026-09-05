@@ -19,17 +19,33 @@ sync_file() { # sync_file <relpath>
   fi
   if cmp -s "$src" "$dst"; then
     echo "up to date:      $1"
-  else
-    cp "$dst" "$dst.prev"
-    cp "$src" "$dst"
-    echo "updated:         $1  (old copy kept as $1.prev)"
-    echo "                 review with: diff \"$dst.prev\" \"$dst\""
-    echo "                 then delete the .prev — it's yours to remove"
+    if [ -e "$dst.prev" ]; then
+      echo "                 (stale $1.prev still present — delete when reviewed)"
+    fi
+    return
   fi
+  if [ -e "$dst.prev" ]; then
+    echo "REFUSED:         $1 — $1.prev already exists and would be overwritten."
+    echo "                 Review it (diff \"$dst.prev\" \"$dst\"), delete it, re-run sync."
+    return
+  fi
+  cp "$dst" "$dst.prev"
+  cp "$src" "$dst"
+  echo "updated:         $1  (old copy kept as $1.prev)"
+  echo "                 review with: diff \"$dst.prev\" \"$dst\""
+  echo "                 then delete the .prev — it's yours to remove"
 }
 
 sync_file .claude/hooks/gate.py
-sync_file .claude/settings.json
+
+# settings.json is kit-managed only if it wires gate.py; a settings.json
+# without that reference is a team-owned file we must not touch (see
+# WORK-SETUP's tracked-.claude/ branch).
+if [ -e "$TARGET/.claude/settings.json" ] && ! grep -q "hooks/gate.py" "$TARGET/.claude/settings.json"; then
+  echo "skipped:         .claude/settings.json (no gate.py reference — team-owned, not kit-managed)"
+else
+  sync_file .claude/settings.json
+fi
 
 if [ -e "$TARGET/.claude/settings.local.json" ]; then
   echo ""
