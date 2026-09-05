@@ -90,6 +90,25 @@ def skip_visibly(message: str) -> int:
     return 0
 
 
+def clear_stale_pyc(source: Path) -> None:
+    """Drop every cached compilation of the file that was just edited.
+
+    Python validates .pyc files by source mtime + size. An edit that keeps
+    the size and lands in the same second (exactly the one-character fixes a
+    hook sees the instant they happen) leaves a stale but valid-looking .pyc,
+    and pytest then silently runs the PREVIOUS version of the test.
+    PYTHONDONTWRITEBYTECODE does not help — caches are still read. Deleting
+    the edited file's cache entries is the only reliable guard.
+    """
+    pycache = source.parent / "__pycache__"
+    if pycache.is_dir():
+        for pyc in pycache.glob(source.stem + ".*.pyc"):
+            try:
+                pyc.unlink()
+            except OSError:
+                pass
+
+
 def uv_available(root: Path) -> bool:
     """Project tools (ruff, pytest) live in the uv-managed venv, not on PATH."""
     return bool(shutil.which("uv")) and (root / "pyproject.toml").is_file()
@@ -158,6 +177,7 @@ def main() -> int:
             file_path = (payload.get("tool_input") or {}).get("file_path", "")
             if not file_path.endswith(".py"):
                 return 0  # only gate Python edits
+            clear_stale_pyc(Path(file_path))
             if uv_available(root):
                 ruff_cmd = ["uv", "run", "ruff"]
             else:
