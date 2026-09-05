@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/gate.py\"",
-            "timeout": 300
+            "timeout": 600
           }
         ]
       }
@@ -18,7 +18,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/gate.py\" --stop",
-            "timeout": 300
+            "timeout": 600
           }
         ]
       }

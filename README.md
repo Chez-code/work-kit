@@ -20,7 +20,12 @@ loop — so the agent cannot hand you code that hasn't survived them.
   - `CLAUDE.md.template` — project brief template: mission, [LOCKED] specs,
     build order, working agreements
 - `bootstrap.sh` — copies the kit into a target repo; idempotent, never
-  overwrites existing files
+  overwrites existing files; skips the Python-only pre-commit/CI templates
+  when the target is a .NET repo
+- `sync.sh` — updates kit-managed files in an already-bootstrapped repo;
+  every replaced file is kept as `<file>.prev` for review
+- `WORK-SETUP.md` — step-by-step install/update instructions for a .NET/C#
+  machine, written so a Claude Code session there can apply them directly
 
 ## Install
 
@@ -45,12 +50,34 @@ cd /path/to/repo
 ## Adapting to your stack
 
 `gate.py` auto-detects the stack: a `pyproject.toml` repo gets ruff + pytest
-(uv-managed venv preferred); a `.sln`/`.csproj` repo gets `dotnet build` after
-each edit and `dotnet build` + `dotnet test` at Stop. For any other stack, swap
-the commands in `gate.py` — the hook wiring in `settings.json` is
-stack-agnostic. `.pre-commit-config.yaml` and `ci.yml` are Python-specific
-templates; translate or skip them elsewhere.
+(uv-managed venv preferred); a repo with a `.sln`/`.slnx`/`.csproj` (root or
+one level down) gets `dotnet build` after each edit and `dotnet build` +
+`dotnet test --no-build` at Stop. Multi-solution repos: the gate skips with a
+visible message rather than guess — set `GATE_DOTNET_TARGET` to pin the
+target (the message shows how). For any other stack, swap the commands in
+`gate.py` — the hook wiring in `settings.json` is stack-agnostic.
+`.pre-commit-config.yaml` and `ci.yml` are Python-specific templates
+(bootstrap skips them on .NET repos automatically).
+
+Two knobs via environment: `GATE_DOTNET_TARGET` (above) and `GATE_TIMEOUT` —
+the whole-gate time budget in seconds (default 540). Keep it below the
+hook-level `timeout` in settings (600), so a hung build/test is reported as a
+blocking gate failure instead of being silently killed by the harness.
 
 In a shared repo, consider putting the hooks block in
 `.claude/settings.local.json` (untracked) rather than committing
 `settings.json`, so you're not imposing hooks on collaborators.
+
+## Advanced: async Stop gate
+
+By default the Stop gate blocks until the full suite finishes — that blocking
+is the harness's core guarantee. For a slow suite you can trade the guarantee
+for speed: `kit/.claude/settings.async-stop.example.json` (a reference file —
+bootstrap and sync never install it) shows a Stop entry with
+`"asyncRewake": true`. The suite then runs in the background; Claude can
+declare done before it finishes but is woken with the failure output if it
+goes red. Notes: hook timeouts are NOT enforced on async hooks, and this
+needs a Claude Code version whose docs list `asyncRewake`. To opt in, MERGE
+that hooks block into your repo's `.claude/settings.local.json` — don't copy
+the file over it, since Claude Code accumulates permission allow rules there
+that a copy would wipe.

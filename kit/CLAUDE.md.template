@@ -37,6 +37,18 @@ now.
   hooks enforce this; do not disable them.
 - If a [LOCKED] spec blocks a task, stop and say so rather than work around it.
 
+## If verification fails
+
+1. The gate feeds the failure straight back — fix it and retry. This is the
+   normal loop, not an exception.
+2. Stuck or looping on the same failure? `/rewind` restores files and
+   conversation to before the bad edit (edits are checkpointed
+   automatically); take a different approach from there.
+3. Honest limit: the Stop gate blocks once per stop (the anti-loop
+   `stop_hook_active` pattern) — a second consecutive stop is NOT re-gated,
+   so a red suite can still be handed back. Treat any Stop-gate failure text
+   as unfinished work, never as a formality.
+
 ## Commands
 
 - Test: `uv run pytest -q`
