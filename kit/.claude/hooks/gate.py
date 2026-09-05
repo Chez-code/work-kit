@@ -177,7 +177,10 @@ def main() -> int:
             file_path = (payload.get("tool_input") or {}).get("file_path", "")
             if not file_path.endswith(".py"):
                 return 0  # only gate Python edits
-            clear_stale_pyc(Path(file_path))
+            # Payloads carry absolute paths in practice; resolve against the
+            # repo root so the cache lookup stays correct if that changes.
+            edited = Path(file_path)
+            clear_stale_pyc(edited if edited.is_absolute() else root / edited)
             if uv_available(root):
                 ruff_cmd = ["uv", "run", "ruff"]
             else:

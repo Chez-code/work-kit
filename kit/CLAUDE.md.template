@@ -48,6 +48,10 @@ now.
    `stop_hook_active` pattern) — a second consecutive stop is NOT re-gated,
    so a red suite can still be handed back. Treat any Stop-gate failure text
    as unfinished work, never as a formality.
+4. Known blind spot: edits made through Bash (`sed -i`, heredocs, scripts)
+   never trigger the edit gate — only Write/Edit tool calls do. The Stop
+   gate is the sole net under shell-side edits, and per point 3 it lets go
+   on the second stop. Prefer the Write/Edit tools for source changes.
 
 ## Commands
 
