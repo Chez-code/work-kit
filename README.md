@@ -26,6 +26,11 @@ loop — so the agent cannot hand you code that hasn't survived them.
   every replaced file is kept as `<file>.prev` for review
 - `WORK-SETUP.md` — step-by-step install/update instructions for a .NET/C#
   machine, written so a Claude Code session there can apply them directly
+- `OPERATOR.md` — the human half of the harness: the operator's loop, what
+  to watch in the transcript, file tools vs shell edits, `/rewind` and loop
+  detection, per-hook `GATE_DOTNET_TARGET`
+- `TROUBLESHOOTING.md` — diagnostic ladder and symptom table for when a gate
+  misbehaves
 
 ## Install
 
