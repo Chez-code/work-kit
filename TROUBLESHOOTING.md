@@ -171,7 +171,6 @@ known shapes. It is a net under the Edit-tool path, not a parser of bash.
 Shapes it does not catch, so only the Stop gate stands under them:
 
 - `find ... -exec sed -i ...`, `xargs sed -i`, and `for f in ...; do sed -i "$f"; done`
-- the bare truncation idiom `> file.py` with no command before it
 - `rm -rf src/` on a directory (only file targets with a source extension count)
 - `git checkout -- file`, `git stash`, `git restore`, `patch`, and any tool
   that rewrites files as a side effect

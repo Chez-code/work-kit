@@ -59,7 +59,9 @@ _SCRIPT_WRITE = re.compile(r"""open\s*\(.*['"](w|a|wb|ab|w\+|a\+)['"]""")
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
-_SEP_SPLIT = re.compile(r"(&&|\|\||;|\||&)")
+# A bare `&` splits a segment, but not one touching a `>`: `&>` and `2>&1`
+# must stay whole so the redirect regex can read them.
+_SEP_SPLIT = re.compile(r"(&&|\|\||;|\||(?<!>)&(?!>))")
 
 
 def _tokens(command: str) -> list[str]:
@@ -162,14 +164,14 @@ class Guard:
                 cwd = (cwd / seg[1]) if len(seg) > 1 and not seg[1].startswith("-") else self.root
                 continue
 
-            # redirects apply to any command in the segment
-            for tok in seg[1:]:
+            # redirects apply to any command in the segment, and a bare
+            # `> file.py` (truncation) has the operator as its first word
+            for idx, tok in enumerate(seg):
                 m = _REDIRECT.match(tok)
                 if not m:
                     continue
                 target = m.group(3)
                 if not target:
-                    idx = seg.index(tok)
                     target = seg[idx + 1] if idx + 1 < len(seg) else ""
                 t = self.is_target(target, cwd)
                 if t:

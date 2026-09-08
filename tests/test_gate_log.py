@@ -264,6 +264,16 @@ class GuardMatcher(unittest.TestCase):
         self.assertEqual(self.labels("true&&sed -i 's/a/b/' src/orders.py"), [("in-place edit", "src/orders.py")])
         self.assertEqual(self.labels("dotnet build 2>&1 | tail -n 5"), [])
 
+    def test_ampersand_redirect_forms(self):
+        # review probes: `&>` and `2>&1` must not be split as list operators
+        self.assertEqual(self.labels("echo x &> src/orders.py"), [("redirect into source", "src/orders.py")])
+        self.assertEqual(self.labels("curl 'http://h/?a=1&b=2' > src/orders.py"), [("redirect into source", "src/orders.py")])
+        self.assertEqual(self.labels("dotnet build > src/Orders.cs 2>&1"), [("redirect into source", "src/Orders.cs")])
+        self.assertEqual(self.labels("sed -i 's/a/b/' src/orders.py &"), [("in-place edit", "src/orders.py")])
+
+    def test_bare_truncation(self):
+        self.assertEqual(self.labels("> src/orders.py"), [("redirect into source", "src/orders.py")])
+
     def test_dedup_two_targets(self):
         self.assertEqual(
             self.labels("sed -i 's/a/b/' src/orders.py src/Orders.cs"),
