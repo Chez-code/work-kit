@@ -36,6 +36,9 @@ now.
 - Small commits, one logical change each. Never commit on red tests — the
   hooks enforce this; do not disable them.
 - If a [LOCKED] spec blocks a task, stop and say so rather than work around it.
+- Make source changes with the Edit/Write file tools, never with sed, perl,
+  heredocs or scripts through Bash. The verification gate only sees file
+  tool edits.
 
 ## If verification fails
 
@@ -49,9 +52,14 @@ now.
    so a red suite can still be handed back. Treat any Stop-gate failure text
    as unfinished work, never as a formality.
 4. Known blind spot: edits made through Bash (`sed -i`, heredocs, scripts)
-   never trigger the edit gate — only Write/Edit tool calls do. The Stop
-   gate is the sole net under shell-side edits, and per point 3 it lets go
-   on the second stop. Prefer the Write/Edit tools for source changes.
+   never trigger the edit gate — only Write/Edit tool calls do. The Bash
+   guard notices the common shapes and re-runs the gate on the touched
+   file, but it is a net, not the path. Make source changes with the
+   Edit/Write file tools, never with sed, perl, heredocs or scripts
+   through Bash.
+5. `[LOOP DETECTED]` means the same failure blocked three edits in a row.
+   Do not try a fourth fix. Stop, and report what was tried and why each
+   attempt failed; the operator decides whether to rewind.
 
 ## Commands
 

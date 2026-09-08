@@ -55,11 +55,71 @@ then approve. The gates verify code; the plan is where you verify intent.
 
 ## 3. Execute: what to watch and how
 
-### The transcript viewer (`Ctrl+O`)
+### The watcher pane (`prefix + W`)
+
+Launch `claude` inside tmux from the repo root, then press `prefix + W`. A
+pane opens on the right running `.claude/bin/gate-watch.py`, which tails
+the gate log (`.claude/gate-log.jsonl`) and prints one line per gate event:
+
+```
+12:01:14 EDIT   Orders.cs          green                       4s
+12:01:52 EDIT   Orders.cs          BLOCK                       6s  CS0103: The name 'total' does not exist in t   strike 1
+12:08:10 EDIT   Orders.cs          LOOP                        5s  CS0103: The name 'total' does not exist in t   strike 3
+12:09:00 BASH   Orders.cs          WARN                            in-place edit: sed -i s/a/b/ src/Orders.cs   gate: green
+12:10:22 STOP                      green                      38s  build, test
+12:11:05 STOP                      green                       0s  nothing ran
+12:12:40 STOP                      released green             36s  build, test
+12:13:10 STOP                      RELEASED still failing     40s  Orders.Tests.TotalTest
+12:15:00 PROMPT                                                    strikes reset
+13:00:01 STOP                      SKIP                        0s  [gate] .NET gate skipped (2 solution files found)
+```
+
+Three colors, three levels of attention:
+
+- **Plain**: `green`, `released green`, `PROMPT`. Nothing to do.
+- **Yellow, bell**: `BLOCK`, a `BASH WARN`, a green that says `nothing ran`,
+  a heuristic `WARN` line. Glance at it.
+- **Red, bell, tmux message, status bar turns red**: `LOOP`, `SKIP`,
+  `CRASH`, `KILLED`, `RELEASED still failing`. Act on it.
+
+Line by line:
+
+- `BLOCK ... strike N`: the edit gate failed and fed the failure back.
+  Strike N is how many consecutive blocks named the same set of failures.
+  One or two is a normal fix-and-adjust.
+- `LOOP`: third strike. The gate did not feed the failure back; it told
+  Claude to stop and report what it tried. Your move is section 6.
+- `BASH ... WARN ... gate: X`: Claude changed a source file through Bash.
+  The guard re-ran the gate on that file and X is the result: `green`,
+  `block`, `loop`, `not gated` (an extension the gate ignores, like `.md`)
+  or `target not found` (Python lane, the path did not exist).
+- `green ... nothing ran`: the Stop gate passed without running anything.
+  Usually a Python repo with no `tests/` directory or no test project in
+  the solution. Green here means nothing was verified.
+- `released green` / `RELEASED still failing`: the second consecutive stop,
+  which the gate lets through by design. It still ran the suite; the
+  second form means Claude handed back a red suite. Read section 4.
+- `PROMPT ... strikes reset`: you sent a prompt. The loop counter starts
+  over, and the status bar goes back to normal.
+- `SKIP`, `CRASH`, `KILLED`: nothing was verified. Skip says why (PATH,
+  ambiguous target). Crash is a bug in the gate. Killed means the hook hit
+  the 600 s harness timeout, which is a hang in the build or suite.
+- Indented `WARN` lines are heuristics from the edit sizes: `shrinking
+  edits` (three blocked edits, each smaller), `oscillating on <file>`
+  (add, remove, add), `editing the failing test <file>` (a test named in
+  the failure was edited while red). They are hints, not verdicts.
+
+`[sub]` on a line means a subagent produced it. The status bar returns to
+its saved style on the next green Stop or your next prompt; `Ctrl+C` in
+the pane restores it too.
+
+### The transcript viewer (`Ctrl+O`): the fallback
 
 `Ctrl+O` toggles the transcript viewer. It shows the full conversation
 including every tool call Claude makes and the feedback the hooks sent back.
 The normal view shows summaries; the transcript shows the raw sequence.
+Open it when the watcher shows red, or when Claude's summary and the
+watcher disagree.
 
 What a gate looks like in there:
 
@@ -76,33 +136,64 @@ What a gate looks like in there:
   That is a bug in the gate, not in your code. It did not block anything.
 - **Gate skipped**: a system message line beginning `[gate]` saying why. Skips
   mean nothing is being verified until you fix the cause.
+- **Loop detected**: `[LOOP DETECTED] <failure> has failed 3 edits in a row
+  (...). Do not attempt another fix. Stop and tell the operator ...`. Claude's
+  next message should be a report, not another edit.
+- **Bash guard**: a system message `[bash guard] Bash edit to <file>
+  (<what>), gate re-run: <result>`, or on a failed re-run the gate's own
+  `[EDIT GATE FAILED]` text prefixed with `[bash guard]`.
 
-### Why keep it open on the first day
+### The baseline
 
-You are learning the baseline. After a day you know how many edits a normal
-task takes, what a fix-after-block looks like, how long the Stop gate takes on
-your suite, and what "Claude said done and the gate agreed" looks like.
-Without that baseline you cannot tell a quiet session from a broken one,
-because a gate that never fires and a gate that always passes look identical
-from the summary view.
+The watcher log is the baseline. After a week, run:
 
-After the first day you open it in three situations: Claude says done and
-something feels off; a task took far more edits than usual; you want to
-confirm the Stop gate actually ran before you commit. The debug log
-(`/debug` shows the path) has everything else, including exit-0 hook output.
+```bash
+python3 .claude/bin/gate-watch.py --stats --since 7d
+```
 
-### The file tools, and how to ask for them
+```
+Sessions            9
+Prompts             41
+Edits               212    (avg 23.6 per session, max 61, 5.2 per prompt)
+Blocks              31     (15%)   avg time to green after block: 1m 40s
+Loops               2
+Bash edits          4      (4 gate re-runs, 1 failed)
+Green, nothing ran  0
+Released stops      3      (1 still failing)
+Skips               1
+Crashes             0
+Killed              0
+Stop gates          14     green 12, block 2, released 3
+```
+
+Those numbers tell you what a normal session looks like, so a quiet session
+and a broken one no longer look the same. A session whose edit count is far
+past the average, or any non-zero in the bottom half, is the cue to open the
+transcript.
+
+### The file tools, and the Bash guard
 
 Claude Code edits files two ways. The file tools, called `Read`, `Edit` and
 `Write`, are what the edit gate watches. Shell commands run through `Bash`,
-such as `sed -i`, `perl -pi`, `cat > file <<EOF`, `echo >> file` or a script
-that rewrites source, are not watched by the edit gate. Only the Stop gate
-stands under them, and the Stop gate blocks once per stop.
+such as `sed -i`, `perl -pi`, `cat > file <<EOF`, `echo >> file`, `tee`,
+`rm`, `mv` or a script that rewrites source, are not watched by the edit
+gate.
 
-The gate does not care which one Claude used; it only fires on the tool
-events it can see. So the operator steers Claude toward the visible path.
+The Bash guard (`bash_guard.py`, a PostToolUse hook on Bash) closes most of
+that gap. When a Bash command matches one of those shapes against a source
+file inside the repo, the guard:
 
-Standing instruction, in CLAUDE.md working agreements:
+1. logs a `bash` event (the watcher shows `BASH ... WARN`),
+2. runs the gate on the touched file (`edit` lines with tool `Bash`), and
+3. tells both of you: a system message for the operator, and a note to
+   Claude that the change was made outside the gate and that the Edit tool
+   is the right path. If the re-run fails, Claude gets the gate's failure
+   text and fixes it as usual.
+
+The guard is a net, not the path. It warns, it does not block, and it cannot
+verify a path it cannot resolve (`target not found`) or an extension the
+gate ignores (`not gated`). So the operator still steers Claude toward the
+visible path. Standing instruction, in CLAUDE.md working agreements:
 
 ```markdown
 - Make source changes with the Edit/Write file tools, never with sed, perl,
@@ -110,18 +201,30 @@ Standing instruction, in CLAUDE.md working agreements:
   tool edits.
 ```
 
-One-off instruction when you see it happen: "Use the Edit tool for that
-change, not sed. The gate did not see that edit." Claude will redo it.
+One-off instruction when the watcher shows a run of `BASH WARN` lines: "Use
+the Edit tool for source changes, not sed. The gate did not see that edit."
 
-Hard stop, if you want one: a permission deny rule in `settings.local.json`
-refuses the common shell rewrites outright.
+Hard stop, if you want one: add the guard as a PreToolUse hook with
+`--block` in `settings.local.json`. It then refuses the command before it
+runs, with a one-line reason Claude can act on.
 
 ```json
-"permissions": { "deny": ["Bash(sed -i*)", "Bash(perl -pi*)"] }
+"PreToolUse": [
+  { "matcher": "Bash", "hooks": [ { "type": "command",
+    "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/bash_guard.py\" --block",
+    "timeout": 10 } ] }
+]
 ```
 
-How you spot a Bash edit in the transcript: the tool call is `Bash` with a
-command string, not `Edit` with a file path and a diff.
+Keep the PostToolUse entry as well: block mode refuses only the shapes that
+have an Edit/Write equivalent (sed, redirects, tee, truncate, inline
+scripts). Deletes, moves and copies have no file tool, so they go through
+and the PostToolUse entry verifies them afterwards.
+
+What the log holds: paths, verdicts, durations, failure keys (a test name or
+a compiler error line), and the first 120 characters of a guarded Bash
+command. It never holds prompt text or build output. It is excluded from
+git by bootstrap.
 
 ## 4. Verdict: reading the Stop gate
 
@@ -131,12 +234,13 @@ verdict is in the transcript, and only there.
 - No `[STOP GATE FAILED]` text after the final message: green. Proceed to
   commit.
 - `[STOP GATE FAILED]` followed by more work, then a second "done": the second
-  stop was not gated. The gate lets go on the second consecutive stop so it
-  cannot loop forever. Read the failure text. If Claude fixed what it named,
-  run the suite yourself once (`! dotnet test` or `! uv run pytest -q` in the
-  prompt runs it in the session) before you trust it. If it did not, say so:
-  "The Stop gate reported X. It is not fixed. Fix it." The next stop is gated
-  again.
+  stop was not blocked. The gate lets go on the second consecutive stop so it
+  cannot loop forever, but it still runs the suite and logs the result. The
+  watcher shows `released green` when Claude's fix was real and `RELEASED
+  still failing` in red when it was not. On the red form say so: "The Stop
+  gate reported X. It is not fixed. Fix it." The next stop is gated again.
+  Without the watcher, run the suite yourself once (`! dotnet test` or
+  `! uv run pytest -q` in the prompt runs it in the session).
 - Skip message at Stop: nothing was verified. Fix the cause before
   committing anything.
 
@@ -145,8 +249,10 @@ on evidence.
 
 ## 5. Anchor: commit green states
 
-Every green Stop is a checkpoint worth keeping. Small commits, one logical
-change each, as the working agreements say. Two reasons beyond hygiene:
+Every green Stop is a checkpoint worth keeping. The watcher's last `STOP`
+line should read `green` with something in the `ran` column, not `nothing
+ran`, `SKIP` or `RELEASED still failing`. Small commits, one logical change
+each, as the working agreements say. Two reasons beyond hygiene:
 
 - `/rewind` restores file-tool edits only. Shell-made changes and subagent
   edits are outside its reach. Git covers those.
@@ -201,34 +307,40 @@ days after the session last saved one.
 A loop is Claude trying to fix the same failure repeatedly without making
 progress. The gate feeds the failure back each time, so the loop shows up as
 repeated `[EDIT GATE FAILED]` blocks. The signals, in rough order of how early
-they appear:
+they appear, and who watches for each:
 
-1. **Same test name, third time.** The failure text names the same test or
-   the same compiler error in three consecutive gate blocks. Two is a normal
-   fix-and-adjust. Three is a loop.
-2. **Oscillation.** The fix adds something, the next fix removes it, the next
-   adds it back. Claude is trying to satisfy two constraints it has not
-   noticed conflict.
-3. **Shrinking edits.** Each fix is smaller than the last and changes less.
-   Claude is out of ideas and is nudging.
-4. **Editing the test instead of the code.** The failing test gets modified,
-   weakened, skipped or deleted. Unless the test was actually wrong, this is
-   the loop escaping sideways.
-5. **Proposing to disable the gate.** Any suggestion to skip the hook,
+1. **Same failure, third time.** Automatic. The gate compares the set of
+   failures between consecutive blocks; three identical sets is `LOOP`. The
+   gate stops feeding the failure back and tells Claude to stop and report.
+   A changed set (four errors became one) is progress, not a strike. Your
+   next prompt resets the count, so after a rewind Claude starts at zero.
+2. **Oscillation.** Watcher heuristic (`oscillating on <file>`): three edits
+   to one file whose sizes go add, remove, add. Claude is trying to satisfy
+   two constraints it has not noticed conflict.
+3. **Shrinking edits.** Watcher heuristic (`shrinking edits`): three blocked
+   edits, each smaller than the last. Claude is out of ideas and is nudging.
+4. **Editing the test instead of the code.** Watcher heuristic (`editing the
+   failing test`). Unless the test was actually wrong, this is the loop
+   escaping sideways.
+5. **Proposing to disable the gate.** Yours. Any suggestion to skip the hook,
    comment out the test, or run with the check off.
-6. **Switching to Bash for the edit.** Often unconscious, but it takes the
-   edit out of the gate's sight.
+6. **Switching to Bash for the edit.** Guard. Shows as `BASH WARN`; a run of
+   them while red is the loop escaping sideways.
 
 Signals 4 through 6 are worth interrupting immediately (`Esc` stops Claude
-mid-turn). Signals 1 through 3 are the "three strikes" rule: on the third
-block for the same failure, rewind.
+mid-turn). Signal 1 interrupts itself; when you see `LOOP`, rewind.
+
+To clear the strike count by hand (say, after you fixed the cause outside
+Claude), send any prompt, or delete `.claude/gate-state.json`.
 
 ### How to rewind out of a loop
 
 1. `Esc` to interrupt if Claude is mid-turn.
 2. `Esc` `Esc` (empty prompt) or `/rewind`.
 3. Pick the prompt just before the failed approach started. Usually that is
-   the prompt where you asked for the feature, not the fixes after it.
+   the prompt where you asked for the feature, not the fixes after it. The
+   `LOOP` line in the watcher carries the times of the three strikes, which
+   places it in the prompt list.
 4. **Restore code and conversation.**
 5. The original prompt is back in the input. Add what you now know:
    "The previous attempt did X and looped on test Y because Z. Do not do X.
@@ -318,7 +430,8 @@ included.
 
 - Does not disable hooks to get past a block. The block is the harness
   working. Diagnose with `TROUBLESHOOTING.md`.
-- Does not accept "done" without the gate verdict.
+- Does not accept "done" without the gate verdict. `released green` in the
+  watcher is a verdict; Claude's summary is not.
 - Does not let [LOCKED] specs be worked around. If a task conflicts with one,
   the spec changes deliberately or the task does.
 - Does not push through a loop. Three strikes, rewind.

@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+.claude/gate-log.jsonl
+.claude/gate-state.json
+.claude/gate-watch.status-style

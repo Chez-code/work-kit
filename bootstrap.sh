@@ -36,12 +36,35 @@ copy() { # copy <relpath>
 
 copy .claude/settings.json
 copy .claude/hooks/gate.py
+copy .claude/hooks/gate_log.py
+copy .claude/hooks/bash_guard.py
+copy .claude/bin/gate-watch.py
 if [ "$DOTNET" = 1 ]; then
   echo "skip (Python-only, .NET repo): .pre-commit-config.yaml"
   echo "skip (Python-only, .NET repo): .github/workflows/ci.yml"
 else
   copy .pre-commit-config.yaml
   copy .github/workflows/ci.yml
+fi
+
+# Runtime files the hooks write (event log, loop state, saved tmux style) must
+# not show up as untracked. `git rev-parse --git-path` finds the right exclude
+# file in worktrees and submodules too. Idempotent: each line is added once.
+if EXCLUDE="$(git -C "$TARGET" rev-parse --git-path info/exclude 2>/dev/null)"; then
+  case "$EXCLUDE" in /*) ;; *) EXCLUDE="$TARGET/$EXCLUDE" ;; esac
+  mkdir -p "$(dirname "$EXCLUDE")"
+  touch "$EXCLUDE"
+  for entry in .claude/gate-log.jsonl .claude/gate-state.json .claude/gate-watch.status-style; do
+    if grep -qxF "$entry" "$EXCLUDE"; then
+      echo "excluded already: $entry"
+    else
+      echo "$entry" >> "$EXCLUDE"
+      echo "excluded:      $entry  (in $(basename "$(dirname "$EXCLUDE")")/exclude)"
+    fi
+  done
+else
+  echo "note: not a git repo — add .claude/gate-log.jsonl, .claude/gate-state.json"
+  echo "      and .claude/gate-watch.status-style to your ignore rules by hand"
 fi
 
 if [ ! -e "$TARGET/CLAUDE.md" ]; then
@@ -55,8 +78,8 @@ echo ""
 echo "Next steps in $TARGET:"
 echo "  1. Edit CLAUDE.md — fill placeholders, write your [LOCKED] specs"
 if [ "$DOTNET" = 1 ]; then
-  echo "  2. Launch 'claude' and confirm hooks fire (Ctrl+O for verbose)"
+  echo "  2. Launch 'claude' inside tmux; prefix + W opens the gate watcher pane"
 else
   echo "  2. pre-commit install && pre-commit autoupdate"
-  echo "  3. Launch 'claude' and confirm hooks fire (Ctrl+O for verbose)"
+  echo "  3. Launch 'claude' inside tmux; prefix + W opens the gate watcher pane"
 fi

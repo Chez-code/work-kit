@@ -11,9 +11,12 @@ dotnet --version     # the .NET gate shells dotnet build/test
 claude --version
 ```
 
-Version note: the default kit needs nothing newer than basic hook support
-(PostToolUse/Stop command hooks). Only the async-Stop opt-in (see README
-"Advanced") requires a Claude Code version whose docs list `asyncRewake`.
+Version note: the default kit needs PostToolUse, UserPromptSubmit and Stop
+command hooks, and `hookSpecificOutput.additionalContext` on PostToolUse
+(all present in Claude Code 2.x). Only the async-Stop opt-in (see README
+"Advanced") requires a version whose docs list `asyncRewake`. `tmux` is
+optional: without it the watcher runs in any second terminal and alerts are
+bell-only.
 
 ## Fresh install
 
@@ -53,10 +56,20 @@ echo ".claude/settings.local.json" >> .git/info/exclude
   only in this checkout; `sync.sh`'s `.prev` rule is its only safety net.
 - **Repo whose team already commits its own `.claude/`**: leave the team's
   `settings.json` alone (skip the mv entirely — delete the kit-copied one if
-  bootstrap added it). Personal hooks go in `settings.local.json`. For
-  gate.py, either add it to the tracked hooks directory (team-visible) or
-  exclude it by exact path: `echo ".claude/hooks/gate.py" >> .git/info/exclude`
-  — a directory-wide exclude does nothing for already-tracked files.
+  bootstrap added it). Personal hooks go in `settings.local.json`. For the
+  scripts, either add them to the tracked directories (team-visible) or
+  exclude them by exact path — a directory-wide exclude does nothing for
+  already-tracked files:
+
+  ```bash
+  for f in .claude/hooks/gate.py .claude/hooks/gate_log.py .claude/hooks/bash_guard.py .claude/bin/gate-watch.py; do
+    echo "$f" >> .git/info/exclude
+  done
+  ```
+
+  bootstrap already added the three runtime files (`gate-log.jsonl`,
+  `gate-state.json`, `gate-watch.status-style`) to the exclude file; check
+  with `git status` after the first gate run.
 
 ### CLAUDE.md on a .NET repo
 
@@ -94,6 +107,27 @@ git -C ~/work-kit pull
 300 means the harness kills a hung gate before the gate can report it — the
 hang then passes silently.
 
+**One-time step for the watcher release**: two new hook entries. If your
+hooks live in `settings.local.json`, merge these into it by hand (the
+kit's `settings.json` shows them in place):
+
+```json
+"PostToolUse": [
+  { "...": "the existing Write|Edit|MultiEdit entry stays" },
+  { "matcher": "Bash", "hooks": [ { "type": "command",
+    "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/bash_guard.py\"", "timeout": 600 } ] }
+],
+"UserPromptSubmit": [
+  { "hooks": [ { "type": "command",
+    "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/gate.py\" --new-prompt", "timeout": 10 } ] }
+]
+```
+
+Then run `sync.sh` (it installs `gate_log.py`, `bash_guard.py` and
+`bin/gate-watch.py` if bootstrap put them there; on a repo bootstrapped
+before this release, copy them once: `cp ~/work-kit/kit/.claude/hooks/{gate_log,bash_guard}.py .claude/hooks/ && mkdir -p .claude/bin && cp ~/work-kit/kit/.claude/bin/gate-watch.py .claude/bin/`),
+and append the three runtime files to the exclude file as bootstrap would.
+
 ## Smoke test (run in the repo)
 
 Exercises both real dotnet paths without waiting for an organic edit:
@@ -106,6 +140,37 @@ echo '{"cwd":"'"$PWD"'","tool_input":{"file_path":"X.cs"}}' | python3 .claude/ho
 Expect `exit=0` on a green repo; a failure prints the gate's reason. A
 `systemMessage` JSON line means the gate skipped — read it, it says why and
 how to fix it.
+
+Then the guard, the prompt reset and the log:
+
+```bash
+echo '{"cwd":"'"$PWD"'","tool_input":{"command":"sed -i s/a/b/ X.cs"}}' | python3 .claude/hooks/bash_guard.py; echo "exit=$?"
+echo '{}' | python3 .claude/hooks/gate.py --new-prompt; echo "exit=$? (no other output expected)"
+tail -n 4 .claude/gate-log.jsonl
+python3 .claude/bin/gate-watch.py --stats
+git status --short    # gate-log.jsonl must NOT appear
+```
+
+The kit's own tests run from the kit checkout, not the repo:
+
+```bash
+cd ~/work-kit && python3 -m unittest discover tests && tests/smoke.sh
+```
+
+**Capture real dotnet output for the kit test** (once per machine): the
+failure-key patterns for `dotnet build` and `dotnet test` ship with the
+documented formats. Confirm them against the real thing by breaking a
+build on purpose, then paste the lines into `DOTNET_BUILD_SAMPLE` and
+`DOTNET_TEST_SAMPLE` in `~/work-kit/tests/test_gate_log.py` and re-run the
+unittest:
+
+```bash
+dotnet build -v q 2>&1 | grep -m1 ' error '
+dotnet test -v q 2>&1 | grep -m1 'Failed '
+```
+
+Finally, in tmux: launch `claude` from the repo root, press `prefix + W`,
+make one `.cs` edit, and watch the `EDIT ... green` line appear.
 
 ## Paste-ready prompts for the machine's Claude
 

@@ -8,13 +8,23 @@ loop — so the agent cannot hand you code that hasn't survived them.
 ## Contents
 
 - `tmux.conf` — tmux config: mouse on, 100k history, tpm with
-  sensible/resurrect/continuum (sessions survive reboots)
+  sensible/resurrect/continuum (sessions survive reboots); `prefix + W`
+  opens the gate watcher pane
 - `kit/` — the Claude Code harness, dropped into any repo:
-  - `.claude/settings.json` — two hooks: **PostToolUse** (after every
-    Write/Edit: ruff-fix the touched file, run fast tests) and **Stop** (full
-    test suite before the agent may declare a task done)
-  - `.claude/hooks/gate.py` — the gate script both hooks call; stdlib-only,
-    exit 2 feeds the failure output straight back to the agent to fix
+  - `.claude/settings.json` — four hooks: **PostToolUse** on Write/Edit
+    (ruff-fix the touched file, run fast tests), **PostToolUse** on Bash
+    (the Bash guard), **UserPromptSubmit** (reset the loop counter) and
+    **Stop** (full test suite before the agent may declare a task done)
+  - `.claude/hooks/gate.py` — the gate script; stdlib-only, exit 2 feeds the
+    failure output straight back to the agent to fix. Logs every run to
+    `.claude/gate-log.jsonl` and stops feeding a failure back after three
+    identical blocks in a row (`[LOOP DETECTED]`, see OPERATOR.md)
+  - `.claude/hooks/bash_guard.py` — watches Bash for `sed -i`, heredocs,
+    `tee`, `rm` and friends on source files, warns, and re-runs the gate on
+    the touched file so the change is verified anyway
+  - `.claude/hooks/gate_log.py` — shared log / failure-key / loop-state code
+  - `.claude/bin/gate-watch.py` — the operator's tmux pane: tails the log,
+    colors events, rings the bell on anything red; `--stats` for a baseline
   - `.pre-commit-config.yaml` — commit-time gate (ruff + mypy)
   - `.github/workflows/ci.yml` — the same gates in CI (GitHub Actions)
   - `CLAUDE.md.template` — project brief template: mission, [LOCKED] specs,
@@ -31,6 +41,11 @@ loop — so the agent cannot hand you code that hasn't survived them.
   detection, per-hook `GATE_DOTNET_TARGET`
 - `TROUBLESHOOTING.md` — diagnostic ladder and symptom table for when a gate
   misbehaves
+- `OPERATOR-NEXT.md` — design for the next operator automation: what shipped
+  (log, guard, loop detector, watcher) and what is still design (spec
+  check, reviewer loop)
+- `tests/` — kit self-tests: `python3 -m unittest discover tests` and
+  `tests/smoke.sh` (end-to-end with a fake `dotnet`, no SDK needed)
 
 ## Install
 
@@ -64,10 +79,12 @@ target (the message shows how). For any other stack, swap the commands in
 `.pre-commit-config.yaml` and `ci.yml` are Python-specific templates
 (bootstrap skips them on .NET repos automatically).
 
-Two knobs via environment: `GATE_DOTNET_TARGET` (above) and `GATE_TIMEOUT` —
-the whole-gate time budget in seconds (default 540). Keep it below the
+Three knobs via environment: `GATE_DOTNET_TARGET` (above), `GATE_TIMEOUT` —
+the whole-gate time budget in seconds (default 540; keep it below the
 hook-level `timeout` in settings (600), so a hung build/test is reported as a
-blocking gate failure instead of being silently killed by the harness.
+blocking gate failure instead of being silently killed by the harness) —
+and `GATE_LOOP_STRIKES`, the number of identical consecutive blocks before
+the gate tells Claude to stop and report (default 3).
 
 In a shared repo, consider putting the hooks block in
 `.claude/settings.local.json` (untracked) rather than committing

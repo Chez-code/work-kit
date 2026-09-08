@@ -37,6 +37,9 @@ sync_file() { # sync_file <relpath>
 }
 
 sync_file .claude/hooks/gate.py
+sync_file .claude/hooks/gate_log.py
+sync_file .claude/hooks/bash_guard.py
+sync_file .claude/bin/gate-watch.py
 
 # settings.json is kit-managed only if it wires gate.py; a settings.json
 # without that reference is a team-owned file we must not touch (see
