@@ -8,6 +8,7 @@ end-to-end behaviour (real cargo, real crates) is in tests/rust/.
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -276,7 +277,9 @@ class Boxes(unittest.TestCase):
         (self.w.root / "deep" / "er").mkdir(parents=True)
         (self.w.root / "deep" / "er" / ".env.production").write_text("K=2")
         (self.w.root / "target" / "x").mkdir(parents=True)
-        (self.w.root / "target" / "x" / ".env").write_text("not walked")
+        (self.w.root / "target" / "x" / ".env").write_text("a source folder that happens to be called target")
+        (self.w.root / "vendor" / "pkg").mkdir(parents=True)
+        (self.w.root / "vendor" / "pkg" / ".env").write_text("K=3")
         for box in (self.w.build(), self.w.fetch(True)):
             tmpfs = singles(box.opts, "--tmpfs")
             null = [dest for src, dest in pairs(box.opts, "--ro-bind") if src == "/dev/null"]
@@ -285,7 +288,30 @@ class Boxes(unittest.TestCase):
             self.assertIn(str(self.w.root / ".env"), null)
             self.assertIn(str(self.w.root / ".mcp.json"), null)
             self.assertIn(str(self.w.root / "deep" / "er" / ".env.production"), null)
-            self.assertNotIn(str(self.w.root / "target" / "x" / ".env"), null)
+            # nothing is skipped and left visible: folders named target or vendor are searched too
+            self.assertIn(str(self.w.root / "target" / "x" / ".env"), null)
+            self.assertIn(str(self.w.root / "vendor" / "pkg" / ".env"), null)
+
+    def test_caches_and_dependency_trees_are_hidden_whole(self):
+        root = self.w.root
+        (root / "target" / "debug").mkdir(parents=True)
+        (root / "target" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+        (root / "target" / "debug" / ".env").write_text("K=1")
+        (root / "web" / "node_modules" / "left-pad").mkdir(parents=True)
+        (root / "web" / "node_modules" / "left-pad" / ".env").write_text("K=2")
+        (root / "tools" / "venv" / "bin").mkdir(parents=True)
+        (root / "tools" / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        (root / "tools" / "venv" / ".env").write_text("K=3")
+        (root / "src" / "target").mkdir(parents=True)          # real source, no cache marker: stays visible
+        (root / "src" / "target" / "mod.rs").write_text("")
+        for box in (self.w.build(), self.w.fetch(False)):
+            tmpfs = singles(box.opts, "--tmpfs")
+            for hidden in (root / "target", root / "web" / "node_modules", root / "tools" / "venv"):
+                self.assertIn(str(hidden), tmpfs)
+            self.assertNotIn(str(root / "src" / "target"), tmpfs)
+            null = [dest for src, dest in pairs(box.opts, "--ro-bind") if src == "/dev/null"]
+            # inside a folder that is hidden whole there is nothing left to hide one by one
+            self.assertEqual([p for p in null if "node_modules" in p or "/venv/" in p or "/target/debug/" in p], [])
 
     def test_a_writable_folder_is_mounted_before_the_hiding_never_after(self):
         # a later mount covers earlier ones beneath it: hiding has to come last
@@ -309,6 +335,39 @@ class Boxes(unittest.TestCase):
         self.assertLess(mounted, position("--ro-bind", "/dev/null", str(sub / "deeper" / ".env.local")))
         self.assertLess(mounted, position("--tmpfs", str(sub / ".git")))
         self.assertLess(position("--ro-bind", str(self.w.root), str(self.w.root)), mounted)
+
+    def test_a_writable_folder_inside_a_hidden_one_is_refused(self):
+        # the hiding goes on top of it, so the program would write into an empty folder that vanishes
+        cache = self.w.root / "target"
+        (cache / "out").mkdir(parents=True)
+        (cache / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+        for folder in (cache, cache / "out"):
+            with self.assertRaises(rbox.Stop) as caught:
+                rbox.build_box(self.w.dirs, "/usr/bin/bwrap", self.w.toolchain, self.w.project, self.w.root, None, [folder])
+            self.assertEqual(caught.exception.code, rbox.EXIT_REFUSED)
+            self.assertIn("would be lost", caught.exception.message)
+
+    def test_a_tree_too_large_to_search_is_refused_not_half_searched(self):
+        # review finding, same family: nothing may be left visible because rbox did not look at it
+        for n in range(30):
+            (self.w.root / f"data{n}.bin").write_text("")
+        (self.w.root / "zz-last").mkdir()
+        (self.w.root / "zz-last" / ".env").write_text("K=1")
+        saved = (rbox.WALK_LIMIT, rbox.WALK_NOTE)
+        self.addCleanup(lambda: (setattr(rbox, "WALK_LIMIT", saved[0]), setattr(rbox, "WALK_NOTE", saved[1])))
+        rbox.WALK_LIMIT, rbox.WALK_NOTE = 20, 10
+        for make in (self.w.build, lambda: self.w.fetch(False)):
+            with self.assertRaises(rbox.Stop) as caught:
+                make()
+            self.assertEqual(caught.exception.code, rbox.EXIT_CANNOT_RUN)
+            self.assertIn("more than 20 files", caught.exception.message)
+        # under the limit but large: it runs, everything is searched, and it says how large
+        rbox.WALK_LIMIT = 1000
+        noted = io.StringIO()
+        with contextlib.redirect_stderr(noted):
+            box = self.w.build()
+        self.assertIn("searches all of them", noted.getvalue())
+        self.assertIn(str(self.w.root / "zz-last" / ".env"), [d for s, d in pairs(box.opts, "--ro-bind") if s == "/dev/null"])
 
     def test_a_writable_folder_outside_the_project_gets_the_same_hiding(self):
         outside = self.w.root.parent / "tapes"
@@ -462,14 +521,65 @@ class Approvals(unittest.TestCase):
         rbox.add_pairs(self.w.project.state / "local-ok", [("serde", "third_party/serde")], "# h\n")
         rbox.require_approved(self.w.dirs, self.w.project)
 
-    def describe(self, rows: list, index: dict) -> tuple:
+    def describe(self, rows: list, index: dict, live: dict | None = None, fresh: bool = False) -> tuple:
+        """`index` is what the last sync saved. `live` is what crates.io answers now; None means unreachable."""
         write_meta(self.w, rows)
         (self.w.project.state / "index.json").write_text(json.dumps(index))
         original = rbox.lookup_index
-        rbox.lookup_index = lambda pairs_: {f"{n} {v}": {"unknown": "offline in test"} for n, v in pairs_}
+
+        def answer(pairs_):
+            if live is None:
+                return {f"{n} {v}": {"unknown": "offline in test"} for n, v in pairs_}
+            return {f"{n} {v}": live.get(f"{n} {v}", {"missing": True}) for n, v in pairs_}
+
+        rbox.lookup_index = answer
         self.addCleanup(setattr, rbox, "lookup_index", original)
         state = rbox.approval_state(self.w.dirs, self.w.project)
-        return rbox.describe_pending(self.w.dirs, self.w.project, state)
+        return rbox.describe_pending(self.w.dirs, self.w.project, state, fresh=fresh)
+
+    def test_a_version_removed_after_the_last_sync_is_refused(self):
+        # review finding: only crates with no saved date were looked up again, so this showed as approvable
+        saved = {"gone 1.0.0": {"pubtime": self.published(400)}}
+        for fresh in (False, True):
+            ok, refused = self.describe([crate("gone", "1.0.0")], saved, live={}, fresh=fresh)
+            self.assertEqual(ok, [], f"fresh={fresh}")
+            self.assertIn("not in the crates.io index", refused[0]["why"])
+
+    def test_a_version_yanked_after_the_last_sync_needs_its_name_typed(self):
+        saved = {"pulled 1.0.0": {"pubtime": self.published(400)}}
+        live = {"pulled 1.0.0": {"pubtime": self.published(400), "yanked": True}}
+        ok, refused = self.describe([crate("pulled", "1.0.0")], saved, live=live, fresh=True)
+        self.assertEqual(refused, [])
+        self.assertTrue(ok[0]["yanked"] and ok[0]["by_name"])
+        self.assertIn("YANKED", rbox.crate_line(ok[0])[3])
+
+    def test_a_download_that_differs_from_what_crates_io_lists_is_refused(self):
+        saved = {"calm 1.0.0": {"pubtime": self.published(400), "cksum": "c" * 64}}       # matched at download
+        live = {"calm 1.0.0": {"pubtime": self.published(400), "cksum": "d" * 64}}        # does not match now
+        ok, refused = self.describe([crate("calm", "1.0.0")], saved, live=live, fresh=True)
+        self.assertEqual(ok, [])
+        self.assertIn("does not match the crates.io index", refused[0]["why"])
+
+    def test_no_answer_never_replaces_a_saved_answer(self):
+        saved = {"calm 1.0.0": {"pubtime": self.published(400)}}
+        self.describe([crate("calm", "1.0.0")], saved, live=None, fresh=True)
+        kept = json.loads((self.w.project.state / "index.json").read_text())
+        self.assertEqual(kept, saved)
+
+    def test_approving_needs_a_new_answer_from_crates_io(self):
+        saved = {"calm 1.0.0": {"pubtime": self.published(400)}}
+        ok, refused = self.describe([crate("calm", "1.0.0"), crate("easy", "2.0.0")],
+                                    dict(saved, **{"easy 2.0.0": {"pubtime": self.published(90)}}), live=None, fresh=True)
+        self.assertEqual(ok, [])
+        for item in refused:
+            self.assertIn("could not be reached to check it again (offline in test)", item["why"])
+
+    def test_listing_offline_falls_back_to_the_last_sync_and_says_so(self):
+        saved = {"calm 1.0.0": {"pubtime": self.published(400)}}
+        ok, refused = self.describe([crate("calm", "1.0.0")], saved, live=None, fresh=False)
+        self.assertEqual(refused, [])
+        self.assertTrue(ok[0]["unchecked"])
+        self.assertIn("not re-checked", rbox.crate_line(ok[0])[3])
 
     @staticmethod
     def published(days: float) -> str:
@@ -539,15 +649,17 @@ class Approvals(unittest.TestCase):
         write_meta(self.w, rows)
         (self.w.project.state / "index.json").write_text(json.dumps(index))
         answers = iter(["", "yes", "no"])  # skip the by-name crate, approve code-running, decline the rest
-        saved = (rbox.ask, rbox.require_human, rbox.find_bwrap, rbox.find_project, rbox.Dirs.toolchain)
+        saved = (rbox.ask, rbox.require_human, rbox.find_bwrap, rbox.find_project, rbox.Dirs.toolchain, rbox.lookup_index)
         rbox.ask = lambda prompt: next(answers)
         rbox.require_human = lambda what: None
         rbox.find_bwrap = lambda: "/usr/bin/bwrap"
         rbox.find_project = lambda *a, **k: self.w.project
         rbox.Dirs.toolchain = lambda self_: self.w.toolchain
+        rbox.lookup_index = lambda pairs_: {f"{n} {v}": index[f"{n} {v}"] for n, v in pairs_}  # crates.io, answering now
 
         def restore():
-            rbox.ask, rbox.require_human, rbox.find_bwrap, rbox.find_project, rbox.Dirs.toolchain = saved
+            (rbox.ask, rbox.require_human, rbox.find_bwrap, rbox.find_project, rbox.Dirs.toolchain,
+             rbox.lookup_index) = saved
 
         self.addCleanup(restore)
         real_open = open
@@ -600,6 +712,31 @@ class SmallThings(unittest.TestCase):
             pin.write_text("version 1.100.0\n")
             with self.assertRaises(rbox.Stop):
                 rbox.read_sums(pin, "x86_64-unknown-linux-gnu")
+
+    def test_toolchain_install_takes_no_pin_file_and_a_switch_needs_a_person(self):
+        # review finding: `rbox toolchain install PIN-FILE` let a session move the machine to any release
+        world = World()
+        self.addCleanup(world.close)
+        with self.assertRaises(rbox.Stop) as caught:
+            rbox.cmd_toolchain(world.dirs, ["install", "/tmp/another.sums"])
+        self.assertEqual(caught.exception.code, rbox.EXIT_REFUSED)
+        sha = "a" * 64
+        world.dirs.share.mkdir(parents=True, exist_ok=True)
+        (world.dirs.share / "toolchain.sums").write_text(
+            f"version 1.101.0\n{rbox.machine_triple()} {sha} https://static.rust-lang.org/dist/x.tar.xz\n")
+        (world.dirs.share / "toolchain").write_text("1.100.0\n")     # the machine is on another version today
+        with self.assertRaises(rbox.Stop) as caught:
+            rbox.cmd_toolchain(world.dirs, ["install"])
+        self.assertEqual(caught.exception.code, rbox.EXIT_REFUSED)
+        self.assertIn("switch this machine from Rust 1.100.0 to Rust 1.101.0", caught.exception.message)
+        self.assertEqual((world.dirs.share / "toolchain").read_text(), "1.100.0\n")
+        # deleting the note of which version is in use does not turn a switch into a first install
+        (world.dirs.share / "toolchain").unlink()
+        (world.toolchain / ".rbox-complete").write_text("")
+        with self.assertRaises(rbox.Stop) as caught:
+            rbox.cmd_toolchain(world.dirs, ["install"])
+        self.assertIn("switch this machine from Rust 1.100.0 to Rust 1.101.0", caught.exception.message)
+        self.assertFalse((world.dirs.share / "toolchain").exists())
 
     def test_shipped_pin_file_is_well_formed(self):
         pin = Path(rbox.__file__).resolve().parent / "toolchain.sums"

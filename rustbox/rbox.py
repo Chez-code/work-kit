@@ -83,8 +83,12 @@ PASS_ENV = ("RUST_BACKTRACE", "RUST_LOG", "RUSTFLAGS", "RUSTDOCFLAGS", "NO_COLOR
 PROXY_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy")
 HIDE_DIRS = (".git", ".claude")
 HIDE_FILES = (".mcp.json", ".env", ".envrc", ".netrc", ".npmrc", ".pypirc")
-WALK_PRUNE = {"target", "vendor", "node_modules", ".venv", "__pycache__"}
-WALK_LIMIT = 200000
+# Folders a Rust build has no use for and that can be huge. They are not searched for
+# secrets; they are hidden whole instead, so nothing inside them is ever visible.
+HIDE_WHOLE_NAMES = ("node_modules", "__pycache__")
+HIDE_WHOLE_MARKERS = ("CACHEDIR.TAG", "pyvenv.cfg")  # cargo's own target/ and other caches; Python virtualenvs
+WALK_LIMIT = 2_000_000  # more files than this and rbox will not run there at all: see hidden_paths
+WALK_NOTE = 500_000     # from here on rbox says how big the tree is, long before the limit
 
 
 # ------------------------------------------------------------------ basics
@@ -416,23 +420,33 @@ def check_root(dirs: Dirs, root: Path) -> None:
 
 def hidden_paths(root: Path) -> tuple:
     """(dirs, files) to hide in every box: .git, .claude, .mcp.json, .env, .env.*
-    and a few other files that commonly hold tokens, wherever they appear in the project tree."""
+    and a few other files that commonly hold tokens, wherever they appear in the project tree.
+
+    Every folder is either searched or hidden whole. Nothing is skipped and left
+    visible: a folder named target or vendor is searched like any other, unless it
+    is a cache (cargo's own output carries a CACHEDIR.TAG), which is hidden whole.
+    A tree too large to search in full is not searched in part: rbox does not run
+    there. The search is quick (about four million entries a second), so the limit
+    is far out, and a note appears long before it."""
     hide_dirs: list = []
     hide_files: list = []
     seen = 0
     for current, subdirs, files in os.walk(root):
         seen += len(subdirs) + len(files)
         if seen > WALK_LIMIT:
-            say(f"rbox: note: {root} is very large; secrets deeper than the first {WALK_LIMIT} entries are not hidden")
-            break
+            raise cannot_run(
+                f"{root} holds more than {WALK_LIMIT:,} files outside its caches. rbox will not run with part of "
+                "that unsearched, because a secret file in the unsearched part would be visible in the box",
+                "keep bulk data in a folder of its own, outside this one, and thin it out as it grows",
+            )
         keep = []
         for name in subdirs:
             path = os.path.join(current, name)
-            if name in HIDE_DIRS:
-                if not os.path.islink(path):
-                    hide_dirs.append(path)
-                continue
-            if name in WALK_PRUNE or os.path.islink(path):
+            if os.path.islink(path):
+                continue  # not followed: what it points to is either outside the box or searched in its own place
+            if (name in HIDE_DIRS or name in HIDE_WHOLE_NAMES
+                    or any(os.path.lexists(os.path.join(path, marker)) for marker in HIDE_WHOLE_MARKERS)):
+                hide_dirs.append(path)
                 continue
             keep.append(name)
         subdirs[:] = keep
@@ -442,6 +456,9 @@ def hidden_paths(root: Path) -> tuple:
                 real = os.path.realpath(path)
                 if os.path.isfile(real) and (real == str(root) or real.startswith(str(root) + os.sep)):
                     hide_files.append(real)
+    if seen > WALK_NOTE:
+        say(f"rbox: note: {root} holds {seen:,} files, and rbox searches all of them for secret files at every start. "
+            f"Past {WALK_LIMIT:,} it stops running there: move old data out well before then.")
     return hide_dirs, sorted(set(hide_files))
 
 
@@ -470,8 +487,8 @@ def hide_cargo_config(box: "Box", root: Path, cwd: Path) -> None:
             box.add("--ro-bind", "/dev/null", str(cfg))
 
 
-def hide_secrets(box: "Box", root: Path) -> None:
-    hide_dirs, hide_files = hidden_paths(root)
+def hide_secrets(box: "Box", root: Path, found: tuple | None = None) -> None:
+    hide_dirs, hide_files = found or hidden_paths(root)
     for path in hide_dirs:
         box.add("--tmpfs", path)
     for path in hide_files:
@@ -576,12 +593,18 @@ def build_box(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Pa
     box.add("--ro-bind", str(project.vendor), "/rbox/vendor")
     box.add("--bind", str(project.target), "/rbox/target")
     box.add("--ro-bind", str(project.root), str(project.root))
+    found = hidden_paths(project.root)
     outside = []
     for path in writable or []:
+        covered = next((hidden for hidden in found[0] if inside(Path(path), Path(hidden))), None)
+        if covered:
+            # the hiding goes on top, so the program would write into an empty folder that vanishes with the box
+            raise refuse(f"--rw {path}: that is inside {covered}, which is hidden in the box, so whatever the "
+                         "program wrote there would be lost", "choose a folder that is not a cache, .git or .claude")
         box.add("--bind", str(path), str(path))
         if not inside(Path(path), project.root):
             outside.append(Path(path))
-    hide_secrets(box, project.root)
+    hide_secrets(box, project.root, found)
     for path in outside:
         hide_secrets(box, path)
     box.env.update({
@@ -698,14 +721,34 @@ def download(url: str, dest: Path, sha: str) -> None:
 
 
 def cmd_toolchain(dirs: Dirs, args: list) -> int:
-    if not args or args[0] != "install":
-        raise refuse("usage: rbox toolchain install [PIN-FILE]")
-    sums = Path(args[1]).resolve() if len(args) > 1 else dirs.share / "toolchain.sums"
-    version, parts = read_sums(sums, machine_triple())
+    """Install the Rust release pinned in the toolchain.sums that rustbox/install.sh put
+    next to rbox. There is no way to name another pin file. The first install is open to
+    anyone; changing the machine from one Rust version to another needs a person."""
+    if args != ["install"]:
+        raise refuse("usage: rbox toolchain install",
+                     "it installs the release pinned by the kit (rustbox/toolchain.sums, through rustbox/install.sh)")
+    version, parts = read_sums(dirs.share / "toolchain.sums", machine_triple())
     final = dirs.share / "toolchains" / version
+    try:
+        current = (dirs.share / "toolchain").read_text(encoding="utf-8").strip()
+    except OSError:
+        current = ""
+    if not current:
+        # the note of which version is in use is gone, but a toolchain is on disk: that is still a switch
+        try:
+            others = sorted(p.name for p in (dirs.share / "toolchains").iterdir()
+                            if p.name != version and (p / ".rbox-complete").is_file())
+        except OSError:
+            others = []
+        current = others[-1] if others else ""
+    if current == version and (final / ".rbox-complete").is_file() and (final / "bin" / "cargo").is_file():
+        say(f"rbox: Rust {version} is already installed")
+        return 0
+    if current and current != version:
+        require_human(f"toolchain install (it would switch this machine from Rust {current} to Rust {version})")
     if (final / ".rbox-complete").is_file() and (final / "bin" / "cargo").is_file():
         write_atomic(dirs.share / "toolchain", version + "\n")
-        say(f"rbox: Rust {version} is already installed")
+        say(f"rbox: Rust {version} was already on disk and is now the one in use")
         return 0
     bwrap = find_bwrap()
     dl = dirs.home / ".cache" / "rustbox" / "dl"
@@ -1637,17 +1680,28 @@ def cmd_net(dirs: Dirs, args: list) -> int:
 # ------------------------------------------------------------------- allow
 
 
-def describe_pending(dirs: Dirs, project: Project, state: dict) -> tuple:
+def describe_pending(dirs: Dirs, project: Project, state: dict, fresh: bool = False) -> tuple:
     """(approvable, refused): every pending registry crate with what a person needs
-    to judge it. Refused ones cannot be approved today, and say why."""
+    to judge it. Refused ones cannot be approved today, and say why.
+
+    crates.io is asked again about every pending crate, every time: a version
+    can be yanked or removed after the first sync, and that is exactly when it
+    must not be approved from an old answer. `fresh` (approving) accepts
+    nothing but a new answer; without it (listing) an unreachable index falls
+    back to what the last sync saw, and the row says so."""
     index = read_json(project.state / "index.json", {})
     if not isinstance(index, dict):
         index = {}
-    stale = [(r["name"], r["version"]) for r in state["pending"]
-             if "pubtime" not in index.get(f"{r['name']} {r['version']}", {})
-             and "missing" not in index.get(f"{r['name']} {r['version']}", {})]
-    if stale:
-        index.update(lookup_index(stale))
+    wanted = [(r["name"], r["version"]) for r in state["pending"]]
+    unchecked: dict = {}  # "name version" -> why crates.io gave no answer just now
+    for key, answer in (lookup_index(wanted) if wanted else {}).items():
+        if "unknown" in answer:
+            unchecked[key] = str(answer["unknown"])
+            if not ({"pubtime", "missing"} & set(index.get(key, {}))):
+                index[key] = answer  # nothing better is known; a saved answer is never overwritten by "no answer"
+        else:
+            index[key] = answer
+    if wanted:
         write_atomic(project.state / "index.json", json.dumps(index, indent=0, sort_keys=True))
     urgent = load_pairs(dirs.urgent)
     latest: dict = {}
@@ -1656,7 +1710,8 @@ def describe_pending(dirs: Dirs, project: Project, state: dict) -> tuple:
             latest[name] = (date, version)
     approvable, refused = [], []
     for row in state["pending"]:
-        info = index.get(f"{row['name']} {row['version']}", {})
+        key = f"{row['name']} {row['version']}"
+        info = index.get(key, {})
         days = age_days(info.get("pubtime"))
         item = dict(row)
         item["days"] = days
@@ -1664,8 +1719,15 @@ def describe_pending(dirs: Dirs, project: Project, state: dict) -> tuple:
         item["runs_code"] = bool(row.get("build_script") or row.get("proc_macro"))
         item["yanked"] = bool(info.get("yanked"))
         item["urgent"] = (row["name"], row["version"]) in urgent
+        item["unchecked"] = key in unchecked
         if info.get("missing"):
             item["why"] = "not in the crates.io index (removed?)"
+            refused.append(item)
+        elif info.get("cksum") and row.get("checksum") and info["cksum"] != row["checksum"]:
+            item["why"] = "the downloaded file does not match the crates.io index: do not build, run `rbox sync` again"
+            refused.append(item)
+        elif fresh and item["unchecked"]:
+            item["why"] = f"crates.io could not be reached to check it again ({unchecked[key]})"
             refused.append(item)
         elif days is None:
             item["why"] = "publish date could not be checked (" + str(info.get("unknown", "no date")) + ")"
@@ -1675,7 +1737,8 @@ def describe_pending(dirs: Dirs, project: Project, state: dict) -> tuple:
             item["why"] = f"too new ({age_text(days)}); approvable from {ready.isoformat()}, or `rbox urgent {row['name']}@{row['version']}`"
             refused.append(item)
         else:
-            item["by_name"] = item["urgent"] or (item["runs_code"] and days < YOUNG_DAYS)
+            # pulled past the cooldown, yanked by its authors, or young and running code: by name
+            item["by_name"] = item["urgent"] or item["yanked"] or (item["runs_code"] and days < YOUNG_DAYS)
             approvable.append(item)
     return approvable, refused
 
@@ -1688,6 +1751,8 @@ def crate_line(item: dict) -> list:
         flags.append("YANKED")
     if item.get("urgent"):
         flags.append("urgent override")
+    if item.get("unchecked"):
+        flags.append("not re-checked: crates.io unreachable")
     via = f"via {item['via']}" if item.get("via") else "direct"
     return [item["name"], change, age_text(item.get("days")), ", ".join(flags), via]
 
@@ -1741,7 +1806,7 @@ def review(dirs: Dirs, approve: bool, tsv: bool) -> int:
     if state["bad_source"]:
         names = ", ".join(r["name"] for r in state["bad_source"])
         raise refuse(f"crates from outside crates.io cannot be approved in v1: {names}")
-    approvable, refused = describe_pending(dirs, project, state)
+    approvable, refused = describe_pending(dirs, project, state, fresh=approve)
     local = state["local_pending"]
     if tsv:
         for item in approvable + refused:
@@ -1765,7 +1830,8 @@ def review(dirs: Dirs, approve: bool, tsv: bool) -> int:
     other = [i for i in approvable if not i["runs_code"] and not i.get("by_name")]
     named = [i for i in approvable if i.get("by_name")]
     for item in named:
-        why = "urgent override" if item["urgent"] else f"runs code at build time and was {age_text(item['days'])}"
+        why = ("urgent override" if item["urgent"] else "its authors YANKED this version" if item["yanked"]
+               else f"runs code at build time and was {age_text(item['days'])}")
         typed = ask(f"{item['name']} {item['version']}: {why}.\n  Type its name to approve it, or Enter to skip: ")
         if typed == item["name"]:
             approved.append(item)
@@ -2056,6 +2122,10 @@ SELFTEST_PROBES = [
     "read hidden project file .git/config",
     "read hidden project file sub/.env.local",
     "read hidden project file .claude/settings.local.json",
+    "read hidden project file vendor/pkg/.env",            # a folder named vendor is searched like any other
+    "read hidden project file target/debug/.env",          # a cache folder (CACHEDIR.TAG) is hidden whole
+    "read hidden project file web/node_modules/pkg/.env",  # hidden whole
+    "read hidden project file tools/venv/.env",            # a Python virtualenv (pyvenv.cfg) is hidden whole
     "connect to the internet (TCP)",
     "send to the internet (UDP)",
     "connect to a service on this machine (TCP)",
@@ -2166,10 +2236,13 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
         # secrets the box must hide, and a canary outside the project
         canary_file.parent.mkdir(parents=True, exist_ok=True)
         canary_file.write_text(canary + "\n", encoding="utf-8")
-        for relative in (".env", ".mcp.json", ".git/config", "sub/.env.local", ".claude/settings.local.json"):
+        for relative in (".env", ".mcp.json", ".git/config", "sub/.env.local", ".claude/settings.local.json",
+                         "vendor/pkg/.env", "target/debug/.env", "web/node_modules/pkg/.env", "tools/venv/.env"):
             target = root / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(f"SECRET={canary}\n", encoding="utf-8")
+        (root / "target" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n", encoding="utf-8")
+        (root / "tools" / "venv" / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding="utf-8")
         (root / ".git" / "hooks").mkdir(parents=True, exist_ok=True)
         config = [
             f"pub const CANARY: &str = {rust_str(canary)};",

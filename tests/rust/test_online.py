@@ -15,6 +15,7 @@ check that it refuses anything else.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -432,6 +433,74 @@ class Online(unittest.TestCase):
             self.assertIn("sub/notes.txt => READ plain", out)   # control: the folder itself is visible
         code, out = self.run_rbox(["run", "--rw", "sub/.git", "--", "peek", ".env"], proj)
         self.assertEqual(code, rbox.EXIT_REFUSED, out)             # a hidden folder cannot be made writable
+
+    def test_25_no_folder_is_left_unsearched(self):
+        # review finding: folders named target, vendor, node_modules and .venv were skipped and stayed visible
+        proj = self.new_project("peek2")
+        (proj / "src" / "main.rs").write_text(self.PEEK_RS)
+        self.assertEqual(self.run_rbox(["cargo", "build"], proj)[0], 0)
+        secrets = ["vendor/pkg/.env", "target/debug/.env", "web/node_modules/pkg/.env", "tools/venv/.env",
+                   ".venv/.env", "src/target/.env"]
+        for relative in secrets:
+            (proj / relative).parent.mkdir(parents=True, exist_ok=True)
+            (proj / relative).write_text("SECRET=hunter2\n")
+        (proj / "target" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")  # as cargo writes it
+        for venv in ("tools/venv", ".venv"):
+            (proj / venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        (proj / "vendor" / "pkg" / "lib.c").write_text("plain\n")
+        (proj / "src" / "target" / "notes.txt").write_text("plain\n")
+        (proj / "target" / "debug" / "old.txt").write_text("stale build output\n")
+        code, out = self.run_rbox(["run", "--", "peek2", *secrets, "vendor/pkg/lib.c", "src/target/notes.txt",
+                                   "target/debug/old.txt"], proj)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("hunter2", out)
+        # controls: a folder that is only named vendor or target is searched, not hidden
+        self.assertIn("vendor/pkg/lib.c => READ plain", out)
+        self.assertIn("src/target/notes.txt => READ plain", out)
+        # a cache folder is hidden whole
+        self.assertIn("target/debug/old.txt => BLOCKED", out)
+        # and cannot be made writable: the program's output would land in an empty folder and vanish
+        code, out = self.run_rbox(["run", "--rw", "target/debug", "--", "peek2", ".env"], proj)
+        self.assertEqual(code, rbox.EXIT_REFUSED, out)
+        self.assertIn("would be lost", out)
+        # the fetch box hides the same things: cargo fmt still works with them in place
+        self.assertEqual(self.run_rbox(["cargo", "fmt", "--check"], proj)[0], 0)
+
+    def test_26_crates_io_is_asked_again_about_every_pending_crate(self):
+        # review finding: only crates with no saved publish date were looked up again
+        proj = self.new_project("stale")
+        self.assertEqual(self.run_rbox(["cargo", "add", "scopeguard"], proj)[0], 0)
+
+        def row() -> list:
+            code, out = self.run_rbox(["pending", "--tsv"], proj)
+            self.assertEqual(code, 0, out)
+            return [line.split("\t") for line in out.splitlines() if line.startswith("scopeguard\t")][0]
+
+        first = row()
+        self.assertEqual(first[5], "approvable")
+        real_days = float(first[4])
+        index_file = self.state_of(proj) / "index.json"
+        index = json.loads(index_file.read_text())
+        key = f"scopeguard {first[1]}"
+        self.assertIn("pubtime", index[key])
+        # a stale answer: saved long ago and wrong by now
+        index[key] = dict(index[key], pubtime="2001-01-01T00:00:00Z", yanked=True)
+        index_file.write_text(json.dumps(index))
+        again = row()
+        self.assertAlmostEqual(float(again[4]), real_days, delta=1.0)
+        saved = json.loads(index_file.read_text())[key]
+        self.assertNotIn("2001", saved["pubtime"])
+        self.assertFalse(saved.get("yanked"))
+
+    def test_27_the_toolchain_pin_cannot_be_swapped_from_the_command_line(self):
+        # review finding: `rbox toolchain install PIN-FILE` let a session move the machine to another release
+        other = self.base / "other.sums"
+        other.write_text((KIT / "rustbox" / "toolchain.sums").read_text().replace("1.100.0", "1.99.0"))
+        code, out = self.run_rbox(["toolchain", "install", str(other)], self.proj)
+        self.assertEqual(code, rbox.EXIT_REFUSED, out)
+        code, out = self.run_rbox(["toolchain", "install"], self.proj)
+        self.assertEqual(code, 0, out)
+        self.assertIn("already installed", out)
 
     def test_24_the_shell_is_not_a_way_around_approval(self):
         # review finding: `rbox shell -c "cargo build"` compiled crates that were still pending

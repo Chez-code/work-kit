@@ -74,6 +74,26 @@ def allow_nested(box, project):
     box.opts = [o for o in box.opts if o != "--disable-userns"]
 
 
+def unhide(relative):
+    """Drop the mount that hides one path, as if rbox had not looked there."""
+
+    def mutate(box, project):
+        path = str(project.root / relative)
+        kept, i = [], 0
+        while i < len(box.opts):
+            if box.opts[i] == "--tmpfs" and box.opts[i + 1:i + 2] == [path]:
+                i += 2
+            elif box.opts[i] == "--ro-bind" and box.opts[i + 1:i + 3] == ["/dev/null", path]:
+                i += 3
+            else:
+                kept.append(box.opts[i])
+                i += 1
+        assert len(kept) < len(box.opts), f"nothing hides {path}"
+        box.opts = kept
+
+    return mutate
+
+
 def proxy_in_sight_while_compiling(box, project):
     # what compiling inside the network box would look like to a build script
     box.env["HTTPS_PROXY"] = "http://127.0.0.1:3128"
@@ -87,6 +107,8 @@ CASES = [
     ("make the project writable", lambda b, p: b.add("--bind", str(p.root), str(p.root)), "write into src/"),
     ("allow nested sandboxes", allow_nested, "create a nested sandbox"),
     ("let a build see the network proxy", proxy_in_sight_while_compiling, "see the network proxy while compiling"),
+    ("skip a folder named vendor when hiding", unhide("vendor/pkg/.env"), "read hidden project file vendor/pkg/.env"),
+    ("leave a cache folder in view", unhide("target"), "read hidden project file target/debug/.env"),
 ]
 
 

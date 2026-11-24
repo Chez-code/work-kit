@@ -115,7 +115,17 @@ pub fn run(stage: &str) {
     }
     let (claude, detail) = file_has("/proc/1/environ", "CLAUDE");
     r.attack("see the caller's other variables (/proc/1/environ)", claude, &detail);
-    for hidden in [".env", ".mcp.json", ".git/config", "sub/.env.local", ".claude/settings.local.json"] {
+    for hidden in [
+        ".env",
+        ".mcp.json",
+        ".git/config",
+        "sub/.env.local",
+        ".claude/settings.local.json",
+        "vendor/pkg/.env",
+        "target/debug/.env",
+        "web/node_modules/pkg/.env",
+        "tools/venv/.env",
+    ] {
         let (found, detail) = file_has(&format!("{ROOT}/{hidden}"), CANARY);
         r.attack(&format!("read hidden project file {hidden}"), found, &detail);
     }

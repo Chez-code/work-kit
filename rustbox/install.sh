@@ -56,7 +56,9 @@ for name in rbox cargo; do
 done
 echo "linked:    $BIN/rbox and $BIN/cargo"
 
-"$SHARE/bin/rbox" toolchain install "$SHARE/toolchain.sums"
+# Installs the release pinned in $SHARE/toolchain.sums. If that would switch the
+# machine from one Rust version to another, rbox asks for a person at a terminal.
+"$SHARE/bin/rbox" toolchain install
 
 echo ""
 echo "Checking this machine:"
