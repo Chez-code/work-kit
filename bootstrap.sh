@@ -25,14 +25,15 @@ is_dotnet() {
 }
 DOTNET=0
 is_dotnet && DOTNET=1
-# Rust repo? (Cargo.toml at the root — same rule as gate.py's Rust lane.) The
-# Python templates only belong in a repo the Python lane runs in: not .NET,
-# and either not Rust or Rust with a pyproject.toml (PyO3).
+# Rust in the repo? (Cargo.toml at the root or one level down — same rule as
+# gate.py's Rust lane.) The Python templates only belong in a repo the Python
+# lane runs in: not .NET, and not a repo with a Cargo.toml at its root unless
+# it also has a pyproject.toml (PyO3).
 RUST=0
-[ -f "$TARGET/Cargo.toml" ] && RUST=1
+{ [ -f "$TARGET/Cargo.toml" ] || compgen -G "$TARGET/*/Cargo.toml" >/dev/null 2>&1; } && RUST=1
 PYTHON=1
 [ "$DOTNET" = 1 ] && PYTHON=0
-[ "$RUST" = 1 ] && [ ! -f "$TARGET/pyproject.toml" ] && PYTHON=0
+[ -f "$TARGET/Cargo.toml" ] && [ ! -f "$TARGET/pyproject.toml" ] && PYTHON=0
 
 copy() { # copy <relpath>
   src="$KIT/$1"; dst="$TARGET/$1"

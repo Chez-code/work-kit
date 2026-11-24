@@ -238,7 +238,7 @@ fi
 RSHIM="$WORK/rshim"; mkdir -p "$RSHIM"
 export GATE_RBOX="$RSHIM/rbox"
 rbox_shim() { # rbox_shim <<'SH' ... SH  — body sees $1=cargo $2=<subcommand>
-  { printf '#!/bin/sh\necho "$*" >> "%s/calls.log"\n' "$RSHIM"; cat; } > "$RSHIM/rbox"
+  { printf '#!/bin/sh\necho "$*" >> "%s/calls.log"\npwd >> "%s/cwd.log"\n' "$RSHIM" "$RSHIM"; cat; } > "$RSHIM/rbox"
   chmod +x "$RSHIM/rbox"
 }
 rbox_ok() { rbox_shim <<'SH'
@@ -446,6 +446,15 @@ policy_in "$RR" "$(printf '{"cwd":"%s","tool_name":"Edit","tool_input":{"file_pa
 assert_eq "$RC" 0 "editing project source is allowed"
 policy_in "$REPO" "$(bashp "$REPO" 'rbox allow')"
 assert_eq "$RC" 0 "the guard is inactive in a repo with no Cargo.toml"
+policy_in "$RR" "$(bashp "$RR" 'touch ~/.cache/rustbox/k/vendor/serde-1.0.229/build.rs')"
+assert_eq "$RC" 2 "changing a downloaded crate source is refused"
+assert_has "$ERR" "downloaded crate sources are read-only" "the refusal says why"
+assert_not "$ERR" "Only the user can do this" "and does not suggest the user should patch a crate by hand"
+policy_in "$RR" "$(bashp "$RR" 'find ~/.cache/rustbox/k/vendor -name build.rs | xargs rm')"
+assert_eq "$RC" 2 "nor through a pipe"
+policy_in "$RR" "$(bashp "$RR" 'grep -rn Serialize ~/.cache/rustbox/k/vendor/serde-1.0.229/src | head')"
+assert_eq "$RC" 0 "reading a downloaded crate source is allowed"
+policy_in "$RR" "$(bashp "$RR" 'rbox shell')"; assert_eq "$RC" 2 "rbox shell is the operator's"
 ( cd "$RR" && CLAUDE_PROJECT_DIR="$RR" timeout 2 python3 .claude/bin/gate-watch.py --from-start --no-tmux --no-color > "$WORK/pwatch.txt" || true )
 assert_has "$(cat "$WORK/pwatch.txt")" "POLICY .*REFUSED" "watcher shows policy refusals"
 python3 - "$KIT/kit/.claude/settings.json" <<'PY' || fail "settings.json is not what the guard needs"
@@ -455,7 +464,9 @@ pre = cfg["hooks"]["PreToolUse"][0]
 assert "Bash" in pre["matcher"] and "Edit" in pre["matcher"]
 assert "policy_guard.py" in pre["hooks"][0]["command"] and "|| exit 0" in pre["hooks"][0]["command"]
 deny = cfg["permissions"]["deny"]
-for rule in ("Bash(rbox allow:*)", "Bash(rbox urgent:*)", "Bash(rbox export:*)", "Edit(~/.local/state/rustbox/**)"):
+for rule in ("Bash(rbox allow:*)", "Bash(rbox urgent:*)", "Bash(rbox export:*)", "Bash(rbox shell:*)",
+             "Bash(rbox net allow:*)", "Edit(~/.local/state/rustbox/**)", "Edit(~/.local/share/rustbox/**)",
+             "Edit(~/.cache/rustbox/**)"):
     assert rule in deny, rule
 PY
 ok "settings.json wires the guard and the deny rules"
@@ -474,6 +485,53 @@ assert_has "$SYNC" "added:           .claude/hooks/policy_guard.py" "sync adds t
 [ -f "$OLD/.claude/hooks/policy_guard.py" ] || fail "sync did not install policy_guard.py"; ok "the file is there after sync"
 echo '{}' | CLAUDE_PROJECT_DIR="$WORK/nowhere" sh -c '[ -f "$CLAUDE_PROJECT_DIR/.claude/hooks/policy_guard.py" ] || exit 0; python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/policy_guard.py"'
 assert_eq "$?" 0 "a repo without the guard file does not block every tool call"
+
+# -------------------------------------------------- 19. Rust in a subfolder
+say "19. Rust kept in a subfolder of a .NET repo still gets the lane and the guard"
+SUB="$WORK/subrepo"; mkdir -p "$SUB/src" "$SUB/engine/src"
+( cd "$SUB" && git init -q && touch App.sln engine/Cargo.toml && echo 'class A {}' > src/Orders.cs && echo 'fn main() {}' > engine/src/main.rs )
+"$KIT/bootstrap.sh" "$SUB" > "$WORK/subboot.txt"
+assert_has "$(cat "$WORK/subboot.txt")" "rbox doctor" "bootstrap notices Rust one level down"
+rbox_ok; shim 0; : > "$RSHIM/calls.log"; : > "$RSHIM/cwd.log"; : > "$SHIM/calls.log"
+gate_in "$SUB" "$(edit "$SUB" engine/src/main.rs)"
+assert_eq "$RC" 0 "subfolder .rs edit: green"
+assert_has "$(rlast)" '"ran": \["cargo check --workspace --all-targets --message-format=short (in engine/)"\]' "ran names the folder"
+assert_eq "$(tail -n 1 "$RSHIM/cwd.log")" "$SUB/engine" "cargo ran inside the Rust folder, not the repo root"
+gate_in "$SUB" "$(edit "$SUB" "$SUB/engine/src/main.rs")"
+assert_eq "$(tail -n 1 "$RSHIM/cwd.log")" "$SUB/engine" "an absolute path picks the same folder"
+gate_in "$SUB" "$(edit "$SUB" src/Orders.cs)"
+assert_has "$(rlast)" '"ran": \["dotnet build App.sln' "the .NET side is as before"
+gate_in "$SUB" "$(stop "$SUB")" --stop
+assert_has "$(rlast)" 'dotnet build App.sln.*dotnet test App.sln.*cargo fmt.*(in engine/).*cargo test --workspace (in engine/)' "stop runs both lanes"
+policy_in "$SUB" "$(bashp "$SUB" 'rbox allow')"
+assert_eq "$RC" 2 "the guard is active when the Rust is one level down"
+mkdir -p "$SUB/tools/src"; touch "$SUB/tools/Cargo.toml"; echo 'fn main() {}' > "$SUB/tools/src/main.rs"
+: > "$RSHIM/cwd.log"
+gate_in "$SUB" "$(edit "$SUB" tools/src/main.rs)"
+assert_eq "$(sort -u "$RSHIM/cwd.log")" "$SUB/tools" "two Rust folders: an edit is checked only where it belongs"
+: > "$RSHIM/cwd.log"
+gate_in "$SUB" "$(stop "$SUB")" --stop
+assert_eq "$(sort -u "$RSHIM/cwd.log" | tr '\n' ' ')" "$SUB/engine $SUB/tools " "two Rust folders: stop checks both"
+: > "$RSHIM/calls.log"
+gate_in "$SUB" "$(edit "$SUB" scripts/gen.rs)"
+assert_has "$OUT" 'outside every folder with a Cargo.toml' "a .rs file in no Rust folder: said, not passed off as checked"
+assert_has "$(rlast)" '"verdict": "skip"' "and logged as a skip"
+assert_eq "$(cat "$RSHIM/calls.log")" "" "cargo did not run for it"
+GATE_RUST_DIR=nope gate_in "$SUB" "$(edit "$SUB" engine/src/main.rs)"
+assert_has "$OUT" 'GATE_RUST_DIR=nope: no Cargo.toml there' "a wrong GATE_RUST_DIR is a visible skip, not a block"
+SUB2="$WORK/subrepo2"; mkdir -p "$SUB2/engine/src"
+( cd "$SUB2" && git init -q && touch A.sln B.sln engine/Cargo.toml && echo 'fn main() {}' > engine/src/main.rs )
+"$KIT/bootstrap.sh" "$SUB2" > /dev/null
+: > "$RSHIM/calls.log"
+gate_in "$SUB2" "$(stop "$SUB2")" --stop
+assert_has "$OUT" '.NET gate skipped' "two solutions and no pinned target: the .NET lane skips"
+assert_eq "$(awk '{print $2}' "$RSHIM/calls.log" | tr '\n' ' ')" "fmt clippy test " "a skipped .NET lane does not cut the Rust lane short"
+for extra in a b; do mkdir -p "$SUB/more$extra"; touch "$SUB/more$extra/Cargo.toml"; done
+gate_in "$SUB" "$(stop "$SUB")" --stop
+assert_has "$OUT" 'Set GATE_RUST_DIR' "more than three Rust folders: visible skip that says how to pin one"
+: > "$RSHIM/cwd.log"
+GATE_RUST_DIR=tools gate_in "$SUB" "$(stop "$SUB")" --stop
+assert_eq "$(sort -u "$RSHIM/cwd.log")" "$SUB/tools" "GATE_RUST_DIR pins the folder"
 
 printf '\nALL OK  (%d assertions)  work dir: %s\n' "$PASS" "$WORK"
 cleanup

@@ -280,8 +280,27 @@ class Lanes(unittest.TestCase):
     def test_dotnet_and_rust(self):
         self.assertEqual(gate.active_lanes(self.repo("App.sln", "Cargo.toml")), ["dotnet", "rust"])
 
-    def test_a_cargo_toml_one_level_down_is_not_a_rust_repo(self):
-        self.assertEqual(gate.active_lanes(self.repo("native/Cargo.toml")), ["python"])
+    def test_rust_in_a_subfolder_gets_the_rust_lane_and_leaves_the_others_alone(self):
+        # review finding: a C# repo with its Rust in a subfolder got neither the lane nor the guard
+        self.assertEqual(gate.active_lanes(self.repo("native/Cargo.toml")), ["rust", "python"])
+        self.assertEqual(gate.active_lanes(self.repo("App.sln", "engine/Cargo.toml")), ["dotnet", "rust"])
+        self.assertEqual(gate.active_lanes(self.repo("native/Cargo.toml", "pyproject.toml")), ["rust", "python"])
+
+    def test_rust_folders(self):
+        root = self.repo("Cargo.toml", "crates/a/Cargo.toml")
+        self.assertEqual(gate.rust_dirs(root), [root])                        # the root wins
+        root = self.repo("App.sln", "engine/Cargo.toml", "tools/Cargo.toml", "vendor/Cargo.toml",
+                         ".hidden/Cargo.toml", "deep/er/Cargo.toml")
+        self.assertEqual(gate.rust_dirs(root), [root / "engine", root / "tools"])
+        self.assertEqual(gate.rust_dirs(self.repo("App.sln")), [])
+        os.environ["GATE_RUST_DIR"] = "deep/er"
+        self.addCleanup(os.environ.pop, "GATE_RUST_DIR", None)
+        self.assertEqual(gate.rust_dirs(root), [root / "deep" / "er"])
+
+    def test_the_guard_wakes_up_for_rust_in_a_subfolder_too(self):
+        self.assertTrue(policy_guard.is_rust(self.repo("App.sln", "engine/Cargo.toml")))
+        self.assertTrue(policy_guard.is_rust(self.repo("Cargo.toml")))
+        self.assertFalse(policy_guard.is_rust(self.repo("App.sln")))
 
     def test_the_file_picks_the_lane(self):
         lanes = ["dotnet", "rust", "python"]
@@ -333,6 +352,51 @@ class PolicyGuard(unittest.TestCase):
         "python3 ~/work-kit/tests/rust/world.py /tmp/w cargo build",
         "~/work-kit/tests/rust/world.py /tmp/w allow",
         "find . -name x -exec rbox allow ;",
+        # rbox's pin and toolchain
+        "cat > ~/.local/share/rustbox/toolchain.sums",
+        "echo 1.50.0 > ~/.local/share/rustbox/toolchain",
+        "rbox toolchain install /tmp/other.sums && cat ~/.local/share/rustbox/toolchain.sums",
+        # the downloaded crate sources may be read, never changed
+        "echo '// x' >> ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs",
+        "sed -i s/a/b/ ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs",
+        "cp evil.rs ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs",
+        "tee ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/build.rs",
+        "rm -rf ~/.cache/rustbox",
+        "touch ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/build.rs",
+        "find ~/.cache/rustbox -name '*.rs' -delete",
+        "find ~/.cache/rustbox/30f4387b4995d73b/vendor -name build.rs -exec sh -c 'echo x >> {}' ;",
+        "cd ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229 && touch src/x.rs",
+        "cd ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229 && echo x > build.rs",
+        "python3 -c \"open('/home/u/.cache/rustbox/k/vendor/x/src/lib.rs', 'w').write('x')\"",
+        "grep -c x ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs > ~/.cache/rustbox/out.txt",
+        # ... nor through a pipe, a loop, a variable or a subshell: the whole command has to be a look
+        "find ~/.cache/rustbox/k/vendor -name '*.orig' | xargs rm",
+        "find ~/.cache/rustbox/k/vendor -name build.rs | xargs -n 1 sed -i s/a/b/",
+        "find ~/.cache/rustbox/k/vendor -name build.rs | while read f; do rm \"$f\"; done",
+        "for f in ~/.cache/rustbox/k/vendor/*/build.rs; do echo x >> $f; done",
+        "D=~/.cache/rustbox/k/vendor/serde-1.0.229; touch $D/build.rs",
+        "echo $(rm -rf ~/.cache/rustbox/k/vendor)",
+        "echo `rm -rf ~/.cache/rustbox/k/vendor`",
+        "echo x>~/.cache/rustbox/k/vendor/serde-1.0.229/build.rs",
+        "(cd ~/.cache/rustbox/k/vendor/serde-1.0.229 && patch -p1 < /tmp/fix.diff)",
+        "cd ~/.cache/rustbox/k/vendor && ls; cd /tmp && touch scratch.txt",
+        "bash -c 'cd ~/.cache/rustbox/k/vendor/x && touch y'",
+        "sort -o ~/.cache/rustbox/k/vendor/x/src/lib.rs /tmp/y",
+        "uniq /tmp/y ~/.cache/rustbox/k/vendor/x/src/lib.rs",
+        "sed 's/a/b/w /home/u/.cache/rustbox/k/vendor/x/src/lib.rs' /tmp/y",
+        "awk '{print > \"/home/u/.cache/rustbox/k/vendor/x/src/lib.rs\"}' /tmp/y",
+        "rg --pre /tmp/evil.sh x ~/.cache/rustbox/k/vendor",
+        "git -C ~/.cache/rustbox/k/vendor/x apply /tmp/fix.diff",
+        "patch -d ~/.cache/rustbox/k/vendor/x -p1 -i /tmp/fix.diff",
+        "chmod -R u+w ~/.cache/rustbox",
+        "ln -sfn /tmp/evil ~/.cache/rustbox/k/vendor",
+        "mv ~/.cache/rustbox/k/vendor /tmp/v",
+        "cargo vendor ~/.cache/rustbox/k/vendor",
+        "ls > $XDG_CACHE_HOME/rustbox/k/vendor/x/build.rs",
+        "grep -c \"$(rm -rf ~/.cache/rustbox/k/vendor)\" /tmp/x",
+        "ls ~/.cache/rustbox/k/vendor | tee >(sh)",
+        "ls ~/.cache/rustbox/k/vendor & rm -rf /tmp/x",
+        "touch ${XDG_CACHE_HOME}/rustbox/k/vendor/x/build.rs",
     ]
     ALLOWED = [
         "rbox pending",
@@ -346,6 +410,33 @@ class PolicyGuard(unittest.TestCase):
         "cargo add serde",
         "ls ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src",
         "cat ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs",
+        "grep -rn 'fn serialize' ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src | head -20",
+        "sed -n 1,40p ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs",
+        "find ~/.cache/rustbox/30f4387b4995d73b/vendor -name Cargo.toml | wc -l",
+        "cd ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229 && grep -rn Serialize src | head",
+        "grep -c x ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs > /tmp/count.txt",
+        "ls ~/.cache/rustbox/k/vendor > crates.txt",
+        "for f in ~/.cache/rustbox/k/vendor/*/build.rs; do head -3 $f; done",
+        "find ~/.cache/rustbox/k/vendor -name build.rs | xargs wc -l | sort -n | tail -5",
+        "find ~/.cache/rustbox/k/vendor -name build.rs | while read f; do head -3 \"$f\"; done",
+        "grep -rn 'Command::new' ~/.cache/rustbox/k/vendor/*/build.rs 2>/dev/null | head -40",
+        "grep -n 'fn poll(self: Pin<&mut Self>) -> Poll<()>' ~/.cache/rustbox/k/vendor/tokio-1.50.0/src/lib.rs",
+        "sha256sum ~/.cache/rustbox/k/vendor/serde-1.0.229/src/lib.rs",
+        "jq .package ~/.cache/rustbox/k/vendor/serde-1.0.229/.cargo-checksum.json",
+        "cat $(find ~/.cache/rustbox/k/vendor -name build.rs | head -1)",
+        "ls ~/.cache/rustbox/k/vendor | wc -l; rbox status",
+        "du -sh ~/.cache/rustbox 2>&1",
+        "awk '/fn main/ {print FILENAME\": \"$0}' ~/.cache/rustbox/k/vendor/cc-1.2.40/src/lib.rs",
+        "sort ~/.cache/rustbox/k/vendor/x/Cargo.toml | uniq -c | sort -rn | head",
+        "ls ~/.cache/rustbox-old",
+        # what is inside quotes is text, not a command
+        "grep -rnE 'unsafe|extern \"C\"' ~/.cache/rustbox/k/vendor/libc-0.2.190/src",
+        "grep -n 'a; rm -rf b && c' ~/.cache/rustbox/k/vendor/x/src/lib.rs",
+        "rg -n \"std::process::Command|std::net::\" ~/.cache/rustbox/k/vendor --glob build.rs",
+        "ls ~/.cache/rustbox/k/vendor  # the crates & their versions",
+        "cat $(find ~/.cache/rustbox/k/vendor -name build.rs | head -1) ~/.cache/rustbox/k/vendor/x/Cargo.toml",
+        "if [ -f ~/.cache/rustbox/k/vendor/cc-1.2.40/build.rs ]; then echo yes; else echo no; fi",
+        "rbox clean",
         "unbuffer cargo test",
         "script build.log",
         "git commit -m 'document rbox allow'",
@@ -362,6 +453,24 @@ class PolicyGuard(unittest.TestCase):
     def test_allowed(self):
         for command in self.ALLOWED:
             self.assertIsNone(policy_guard.check_command(command), command)
+
+    def test_simple_commands(self):
+        split = policy_guard.simple_commands
+        self.assertEqual(split("a 1 && b 2 || c; d | e & f"), [["a", "1"], ["b", "2"], ["c"], ["d"], ["e"], ["f"]])
+        self.assertEqual(split("grep -E 'a|b; c' x 2>&1 | head"), [["grep", "-E", "a|b; c", "x", "2>&1"], ["head"]])
+        self.assertEqual(split('echo "x $(rm y) z" w'), [["rm", "y"], ["echo", "x  z", "w"]])
+        self.assertEqual(split("cat `find . -name a | head -1` b"), [["find", ".", "-name", "a"], ["head", "-1"], ["cat", "b"]])
+        self.assertEqual(split("(cd d && ls) > out.txt"), [["cd", "d"], ["ls"], [">", "out.txt"]])
+        self.assertEqual(split("ls a # b; c"), [["ls", "a"]])
+        self.assertEqual(split("ls a\\ b &> log"), [["ls", "a b", "&>", "log"]])
+        self.assertEqual(split("x='unterminated"), [["x=unterminated"]])
+
+    def test_a_refused_write_to_crate_sources_says_what_is_allowed(self):
+        reason = policy_guard.check_command("touch ~/.cache/rustbox/k/vendor/serde-1.0.229/build.rs")
+        self.assertTrue(reason.startswith(policy_guard.READ_ONLY), reason)
+        self.assertIn("`touch`", reason)
+        # the other refusals keep their own wording
+        self.assertFalse(policy_guard.check_command("rbox allow").startswith(policy_guard.READ_ONLY))
 
     def test_edits_inside_rbox_folders_are_refused(self):
         home = Path("/home/u")

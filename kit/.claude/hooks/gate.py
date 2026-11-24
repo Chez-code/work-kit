@@ -12,7 +12,8 @@ picks the lane, and Stop runs every lane the repo has, inside one time budget.
   projects exits 0 — a green Stop means "build ok + any tests that exist
   passed", not "tests exist"; add a test project early. The `ran` field in
   the log says what actually executed.
-- Rust (Cargo.toml at the root): everything goes through rbox, the sandbox
+- Rust (Cargo.toml at the root, or in a folder one level down for a repo that
+  keeps its Rust beside other code): everything goes through rbox, the sandbox
   wrapper from the kit's rustbox/ folder. PostToolUse runs `cargo check`
   after each .rs / Cargo.toml / Cargo.lock edit; Stop runs `cargo fmt --check`,
   `cargo clippy -D warnings` and, if clippy passed, `cargo test`. rbox's own
@@ -53,6 +54,8 @@ Environment:
   the hang pass silently.
 - GATE_LOOP_STRIKES: strikes before [LOOP DETECTED] fires (default 3).
 - GATE_RBOX: path to rbox, when it is not at ~/.local/share/rustbox/bin/rbox.
+- GATE_RUST_DIR: the one folder (relative to the repo root) to run cargo in,
+  when the Rust code is not at the root and auto-detection finds several.
 
 Exit 0  -> proceed.
 Exit 2  -> blocked; stderr is fed back to Claude so it fixes its own mess.
@@ -112,27 +115,52 @@ def is_dotnet(root: Path) -> bool:
     return False
 
 
+NOT_RUST_DIRS = ("target", "vendor", "node_modules")
+MAX_RUST_DIRS = 3
+
+
+def rust_dirs(root: Path) -> list[Path]:
+    """The folders to run cargo in.
+
+    The root, when it has a Cargo.toml. Otherwise every folder one level down
+    that has one: a C# or Python repo that keeps its Rust in a subfolder still
+    gets the Rust lane (the same reach as the .NET detector). GATE_RUST_DIR
+    pins a single folder.
+    """
+    override = os.environ.get("GATE_RUST_DIR")
+    if override:
+        return [root / override]
+    if (root / "Cargo.toml").is_file():
+        return [root]
+    return sorted(
+        p.parent for p in root.glob("*/Cargo.toml")
+        if not p.parent.name.startswith(".") and p.parent.name not in NOT_RUST_DIRS
+    )
+
+
 def is_rust(root: Path) -> bool:
-    """A Cargo.toml at the root marks a Rust repo."""
-    return (root / "Cargo.toml").is_file()
+    """A Cargo.toml at the root, or one level down, marks a repo with Rust in it."""
+    return bool(rust_dirs(root))
 
 
 def active_lanes(root: Path) -> list[str]:
     """Every lane this repo has, in the order Stop runs them.
 
-    .NET repos behave exactly as before (never the Python lane). A Rust repo
-    gets the Rust lane; it keeps the Python lane only when it also has a
-    pyproject.toml (PyO3), because a plain Rust repo's tests/ folder is not a
-    pytest suite. Everything else is Python, as before.
+    .NET repos behave exactly as before (never the Python lane), and gain the
+    Rust lane when they hold a Cargo.toml. A repo with a Cargo.toml at its root
+    keeps the Python lane only when it also has a pyproject.toml (PyO3),
+    because a plain Rust repo's tests/ folder is not a pytest suite. Rust in a
+    subfolder leaves the Python lane as it was. Everything else is Python.
     """
     dotnet = is_dotnet(root)
     rust = is_rust(root)
+    rust_at_root = (root / "Cargo.toml").is_file()
     lanes = []
     if dotnet:
         lanes.append("dotnet")
     if rust:
         lanes.append("rust")
-    if not dotnet and (not rust or (root / "pyproject.toml").is_file()):
+    if not dotnet and (not rust_at_root or (root / "pyproject.toml").is_file()):
         lanes.append("python")
     return lanes
 
@@ -453,9 +481,39 @@ def lane_rust(root: Path, run: Run, stop_mode: bool, deadline: float, file_path:
         )
         return
 
+    folders = rust_dirs(root)
+    missing = [f for f in folders if not (f / "Cargo.toml").is_file()]
+    if missing:  # only GATE_RUST_DIR can name a folder without one
+        out.skips.append(
+            f"[gate] GATE_RUST_DIR={os.environ.get('GATE_RUST_DIR')}: no Cargo.toml there — "
+            "the Rust checks are NOT running."
+        )
+        return
+    if not stop_mode and folders != [root]:
+        # Rust kept in a subfolder: an edit is checked in the Rust folder it belongs to
+        edited = Path(file_path) if os.path.isabs(file_path) else root / file_path
+        folders = [f for f in folders if f in edited.parents]
+        if not folders:
+            out.skips.append(f"[gate] {file_path} is outside every folder with a Cargo.toml — nothing checked it.")
+            return
+    if len(folders) > MAX_RUST_DIRS:
+        out.skips.append(
+            f"[gate] {len(folders)} folders with a Cargo.toml one level down — the Rust checks are NOT running. "
+            "Set GATE_RUST_DIR to the one to check (an env prefix in the hook command)."
+        )
+        return
+    for folder in folders:
+        _rust_checks(rbox, root, folder, run, stop_mode, deadline, out)
+
+
+def _rust_checks(rbox: str, root: Path, folder: Path, run: Run, stop_mode: bool, deadline: float, out: Outcome) -> None:
+    where = "" if folder == root else f" (in {folder.name}/)"
+    held_before = (len(out.pending), len(out.skips))  # what other lanes and folders added is not this folder's
+
     def cargo(label: str, *args: str) -> bool:
         """Run one cargo command through rbox. True when the lane may carry on."""
-        code, text = sh([rbox, "cargo", *args], root, deadline, run.ran, shown="cargo " + " ".join(args))
+        code, text = sh([rbox, "cargo", *args], folder, deadline, run.ran, shown="cargo " + " ".join(args) + where)
+        label += where
         if code == 0:
             return True
         if code in (RBOX_REFUSED, RBOX_CANNOT_RUN, RBOX_WAITING):
@@ -476,7 +534,7 @@ def lane_rust(root: Path, run: Run, stop_mode: bool, deadline: float, file_path:
         return
     # Formatting needs no crates, so it is checked even while crates await approval.
     cargo("fmt --check", "fmt", "--check", "--", "--color", "never")
-    if out.pending or out.skips:
+    if (len(out.pending), len(out.skips)) != held_before:
         return
     if cargo("clippy", "clippy", "--workspace", "--all-targets", "--message-format=short", "--", "-D", "warnings"):
         cargo("test", "test", "--workspace")
