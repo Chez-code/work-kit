@@ -4,8 +4,10 @@
 Needs: rustbox/install.sh has been run, and crates.io is reachable.
 Run from the kit checkout:  python3 tests/rust/test_online.py
 
-Everything happens in a separate test world (RBOX_TEST_BASE): its own approvals
-and its own downloads, so nothing here touches this machine's confirmed set.
+Everything happens in a separate test world (tests/rust/world.py): its own
+approvals and its own downloads, so nothing here touches this machine's
+confirmed set. The installed rbox has no switch for that; the world is chosen
+in code.
 "Approving" in these tests means writing that test world's confirmed file
 directly; the real `rbox allow` needs a person at a terminal, and the tests
 check that it refuses anything else.
@@ -26,6 +28,7 @@ from pathlib import Path
 sys.dont_write_bytecode = True
 KIT = Path(__file__).resolve().parent.parent.parent
 RBOX = str(KIT / "rustbox" / "rbox.py")
+WORLD = str(KIT / "tests" / "rust" / "world.py")  # the kit's rbox in a test world, chosen in code
 sys.path.insert(0, str(KIT / "rustbox"))
 import rbox  # noqa: E402
 
@@ -52,7 +55,7 @@ class Online(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            rbox.Dirs({}).toolchain()
+            rbox.Dirs().toolchain()
         except rbox.Stop as stop:
             raise unittest.SkipTest(stop.message)
         if "error" in rbox.fetch_index("cfg-if"):
@@ -60,8 +63,8 @@ class Online(unittest.TestCase):
         cls.tmp = tempfile.mkdtemp(prefix="rbox-online-")
         cls.base = Path(cls.tmp).resolve()
         cls.world = cls.base / "world"
-        cls.env = dict(os.environ, RBOX_TEST_BASE=str(cls.world))
-        cls.dirs = rbox.Dirs({"RBOX_TEST_BASE": str(cls.world)})
+        cls.env = dict(os.environ)
+        cls.dirs = rbox.Dirs(test_base=cls.world)
         # one project with real dependencies, reused by most tests
         cls.proj = cls.new_project("dep")
         (cls.proj / "src" / "main.rs").write_text(MAIN_RS)
@@ -79,7 +82,7 @@ class Online(unittest.TestCase):
 
     @classmethod
     def run_rbox(cls, args: list, cwd: Path, env: dict | None = None, stdin=subprocess.DEVNULL) -> tuple:
-        done = subprocess.run([RBOX, *args], cwd=str(cwd), env=env or cls.env, stdin=stdin,
+        done = subprocess.run([WORLD, str(cls.world), *args], cwd=str(cwd), env=env or cls.env, stdin=stdin,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
         return done.returncode, done.stdout
 
@@ -135,7 +138,7 @@ class Online(unittest.TestCase):
     @unittest.skipUnless(UNDER_CLAUDE and shutil.which("script"), "only meaningful inside a Claude session")
     def test_04_a_faked_terminal_does_not_help(self):
         clean = {k: v for k, v in self.env.items() if k not in rbox.CLAUDE_MARKERS}
-        done = subprocess.run(["script", "-qec", f"{RBOX} allow", "/dev/null"], cwd=str(self.proj), env=clean,
+        done = subprocess.run(["script", "-qec", f"{WORLD} {self.world} allow", "/dev/null"], cwd=str(self.proj), env=clean,
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               text=True, timeout=30)
         self.assertIn("parent process is a Claude session", done.stdout)
@@ -279,9 +282,9 @@ class Online(unittest.TestCase):
         script = (
             "import sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]); import rbox, os\n"
             "rbox.COOLDOWN_DAYS = 365000\n"
-            "try:\n    code = rbox.cmd_cargo(rbox.Dirs(dict(os.environ)), ['add', 'cfg-if'], False, {})\n"
+            "try:\n    code = rbox.cmd_cargo(rbox.Dirs(test_base=rbox.Path(sys.argv[2])), ['add', 'cfg-if'], False, {})\n"
             "except rbox.Stop as stop:\n    code = stop.code\nsys.exit(code)\n")
-        done = subprocess.run([sys.executable, "-c", script, str(KIT / "rustbox")], cwd=str(proj), env=self.env,
+        done = subprocess.run([sys.executable, "-c", script, str(KIT / "rustbox"), str(self.world)], cwd=str(proj), env=self.env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         self.assertNotEqual(done.returncode, 0, done.stdout)
         self.assertIn("too new", done.stdout)
@@ -302,10 +305,10 @@ class Online(unittest.TestCase):
         script = (
             "import sys; sys.dont_write_bytecode = True; sys.path.insert(0, sys.argv[1]); import rbox, os\n"
             f"rbox.COOLDOWN_DAYS = {age}\n"
-            "dirs = rbox.Dirs(dict(os.environ)); bwrap = rbox.find_bwrap(); tc = dirs.toolchain()\n"
+            "dirs = rbox.Dirs(test_base=rbox.Path(sys.argv[2])); bwrap = rbox.find_bwrap(); tc = dirs.toolchain()\n"
             "p = rbox.Project(dirs, rbox.Path.cwd().resolve())\n"
             "sys.exit(rbox.run_fetch(dirs, bwrap, tc, p, p.root, [rbox.CARGO, 'generate-lockfile', *rbox.cooldown_pins()], network=True))\n")
-        done = subprocess.run([sys.executable, "-c", script, str(KIT / "rustbox")], cwd=str(proj), env=self.env,
+        done = subprocess.run([sys.executable, "-c", script, str(KIT / "rustbox"), str(self.world)], cwd=str(proj), env=self.env,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=120)
         self.assertEqual(done.returncode, 0, done.stdout)
         lock = (proj / "Cargo.lock").read_text()
@@ -402,6 +405,46 @@ class Online(unittest.TestCase):
         shutil.rmtree(self.proj / ".git")
         shutil.rmtree(data)
 
+    PEEK_RS = """fn main() {
+    for path in std::env::args().skip(1) {
+        match std::fs::read_to_string(&path) {
+            Ok(text) => println!("{path} => READ {}", text.trim()),
+            Err(err) => println!("{path} => BLOCKED {err}"),
+        }
+    }
+}
+"""
+
+    def test_23_a_writable_folder_does_not_uncover_what_is_hidden(self):
+        # review finding: `--rw sub` was mounted after the hiding, so sub/.env came back
+        proj = self.new_project("peek")
+        (proj / "src" / "main.rs").write_text(self.PEEK_RS)
+        self.assertEqual(self.run_rbox(["cargo", "build"], proj)[0], 0)
+        secrets = ["sub/.env", "sub/.git/config", "sub/.claude/settings.local.json", "sub/deeper/.env.production", ".env"]
+        for relative in secrets:
+            (proj / relative).parent.mkdir(parents=True, exist_ok=True)
+            (proj / relative).write_text("SECRET=hunter2\n")
+        (proj / "sub" / "notes.txt").write_text("plain\n")
+        for extra in ([], ["--rw", "sub"], ["--rw", "sub/deeper"]):
+            code, out = self.run_rbox(["run", *extra, "--", "peek", *secrets, "sub/notes.txt"], proj)
+            self.assertEqual(code, 0, out)
+            self.assertNotIn("hunter2", out, f"with {extra}: a hidden file was readable")
+            self.assertIn("sub/notes.txt => READ plain", out)   # control: the folder itself is visible
+        code, out = self.run_rbox(["run", "--rw", "sub/.git", "--", "peek", ".env"], proj)
+        self.assertEqual(code, rbox.EXIT_REFUSED, out)             # a hidden folder cannot be made writable
+
+    def test_24_the_shell_is_not_a_way_around_approval(self):
+        # review finding: `rbox shell -c "cargo build"` compiled crates that were still pending
+        proj = self.new_project("shelly")
+        # a crate no other test approves, so it is pending whatever order the tests run in
+        self.assertEqual(self.run_rbox(["cargo", "add", "scopeguard"], proj)[0], 0)
+        self.assertEqual(self.run_rbox(["cargo", "build"], proj)[0], rbox.EXIT_WAITING)
+        code, out = self.run_rbox(["shell", "-c", "cargo build 2>&1; echo shell-exit=$?"], proj)
+        self.assertNotIn("Compiling scopeguard", out)
+        self.assertNotIn("shell-exit=0", out)
+        self.assertEqual(code, rbox.EXIT_REFUSED, out)
+        self.assertFalse(any((self.cache_of(proj) / "target").rglob("libscopeguard*")), "a pending crate was compiled")
+
     def test_21_another_cargo_first_on_path_fails_the_machine_check(self):
         fake = self.base / "fakecargo"
         fake.mkdir()
@@ -421,7 +464,7 @@ class Online(unittest.TestCase):
         # caller -> rbox (which becomes bwrap) -> the program, like the gate calling rbox
         caller = subprocess.Popen(
             [sys.executable, "-c",
-             "import subprocess, sys; subprocess.run(sys.argv[1:])", RBOX, "run", "--", "sleepy", tag],
+             "import subprocess, sys; subprocess.run(sys.argv[1:])", WORLD, str(self.world), "run", "--", "sleepy", tag],
             cwd=str(proj), env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         def running() -> bool:
@@ -506,18 +549,19 @@ class Network(unittest.TestCase):
         import socket
         import threading
         try:
-            rbox.Dirs({}).toolchain()
+            rbox.Dirs().toolchain()
         except rbox.Stop as stop:
             raise unittest.SkipTest(stop.message)
         cls.tmp = tempfile.mkdtemp(prefix="rbox-net-test-")
         cls.base = Path(cls.tmp).resolve()
-        cls.env = dict(os.environ, RBOX_TEST_BASE=str(cls.base / "world"))
-        cls.dirs = rbox.Dirs({"RBOX_TEST_BASE": str(cls.base / "world")})
-        done = subprocess.run([RBOX, "new", "netprobe"], cwd=str(cls.base), env=cls.env, capture_output=True, text=True)
+        cls.world = cls.base / "world"
+        cls.env = dict(os.environ)
+        cls.dirs = rbox.Dirs(test_base=cls.world)
+        done = subprocess.run([WORLD, str(cls.world), "new", "netprobe"], cwd=str(cls.base), env=cls.env, capture_output=True, text=True)
         assert done.returncode == 0, done.stderr
         cls.proj = cls.base / "netprobe"
         (cls.proj / "src" / "main.rs").write_text(NETPROBE_RS)
-        done = subprocess.run([RBOX, "cargo", "build", "-q"], cwd=str(cls.proj), env=cls.env, capture_output=True, text=True)
+        done = subprocess.run([WORLD, str(cls.world), "cargo", "build", "-q"], cwd=str(cls.proj), env=cls.env, capture_output=True, text=True)
         assert done.returncode == 0, done.stdout + done.stderr
         # a service on this machine: answers "pong" to "ping"
         cls.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -556,7 +600,7 @@ class Network(unittest.TestCase):
         (self.state / "net-allow").write_text("".join(f"{t} 2026-11-23\n" for t in targets))
 
     def run_rbox(self, args: list, cwd: Path | None = None) -> tuple:
-        done = subprocess.run([RBOX, *args], cwd=str(cwd or self.proj), env=self.env, stdin=subprocess.DEVNULL,
+        done = subprocess.run([WORLD, str(self.world), *args], cwd=str(cwd or self.proj), env=self.env, stdin=subprocess.DEVNULL,
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
         return done.returncode, done.stdout
 
@@ -611,8 +655,90 @@ class Network(unittest.TestCase):
         self.allow(mine)
         code, out = self.run_rbox(["--net", "cargo", "run", "-q", "--", f"ping:{mine}"])
         self.assertIn(f"ping:{mine} => OK pong", out)
-        code, out = self.run_rbox(["--net", "cargo", "build"])
-        self.assertEqual(code, rbox.EXIT_REFUSED, out)
+        for command in ("build", "check", "clippy", "doc", "bench"):
+            code, out = self.run_rbox(["--net", "cargo", command])
+            self.assertEqual(code, rbox.EXIT_REFUSED, f"{command}: {out}")
+
+    def test_9_compiling_never_gets_the_network_even_with_net(self):
+        # review finding: `rbox --net cargo test` used to compile inside the network box, so build
+        # scripts and proc macros had the proxy. Now cargo compiles with no network first, and only
+        # the finished test programs are run with it.
+        mine = f"127.0.0.1:{self.port}"
+        proj = self.base / "live"
+        done = subprocess.run([WORLD, str(self.world), "new", "live"], cwd=str(self.base), env=self.env, capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        (proj / "Cargo.toml").write_text((proj / "Cargo.toml").read_text().replace('edition = "2024"', 'edition = "2024"\nbuild = "build.rs"'))
+        (proj / "build.rs").write_text(r"""use std::io::Write;
+fn main() {
+    // hostile: ask to be compiled again as soon as a proxy shows up in the environment
+    println!("cargo:rerun-if-env-changed=HTTPS_PROXY");
+    let proxy = std::env::var("HTTPS_PROXY").is_ok();
+    let relay = std::net::TcpStream::connect("127.0.0.1:3128").is_ok();
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open("/rbox/target/buildrs.log").unwrap();
+    writeln!(log, "proxy_variable={proxy} relay_reachable={relay}").unwrap();
+}
+""")
+        (proj / "src" / "main.rs").write_text(NETPROBE_RS)
+        (proj / "tests").mkdir()
+        (proj / "tests" / "live.rs").write_text(r"""use std::io::{Read, Write};
+use std::net::TcpStream;
+
+#[test]
+fn offline() {
+    assert_eq!(2 + 2, 4);
+}
+
+#[test]
+#[ignore = "needs the network: rbox --net cargo test -- --ignored"]
+fn live() {
+    let proxy = std::env::var("HTTPS_PROXY").expect("no proxy: was this run with --net?");
+    let target = std::env::var("LIVE_TARGET").expect("LIVE_TARGET");
+    let mut stream = TcpStream::connect(proxy.trim_start_matches("http://")).expect("proxy");
+    write!(stream, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").expect("send");
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        stream.read_exact(&mut byte).expect("read");
+        head.push(byte[0]);
+    }
+    assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
+    stream.write_all(b"ping\n").expect("ping");
+    let mut answer = [0u8; 5];
+    stream.read_exact(&mut answer).expect("pong");
+    assert_eq!(&answer, b"pong\n");
+    // cargo runs each test program from its package folder; so does rbox
+    assert!(std::path::Path::new("Cargo.toml").exists());
+}
+""")
+        state = rbox.Project(self.dirs, proj).state
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "net-allow").write_text(f"{mine} 2026-11-23\n")
+        env = dict(self.env, LIVE_TARGET=mine)
+
+        def run(*args):
+            done = subprocess.run([WORLD, str(self.world), "--env", "LIVE_TARGET", *args], cwd=str(proj), env=env,
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=300)
+            return done.returncode, done.stdout
+
+        code, out = run("--net", "cargo", "test", "--", "--ignored")          # cold: everything compiles here
+        self.assertEqual(code, 0, out)
+        self.assertIn("compiled without network", out)
+        self.assertRegex(out, r"test live \.\.\. ok")
+        code, out = run("--net", "cargo", "test")                              # the plain tests, still with --net
+        self.assertEqual(code, 0, out)
+        self.assertRegex(out, r"test offline \.\.\. ok")
+        code, out = run("--net", "cargo", "test", "live", "--", "--ignored")   # a test name filter still works
+        self.assertRegex(out, r"test live \.\.\. ok")
+        self.assertNotIn("test offline", out)
+        code, out = run("--net", "cargo", "run", "--", f"ping:{mine}")
+        self.assertIn(f"ping:{mine} => OK pong", out)
+        code, out = run("cargo", "test")                                       # without --net the live test stays ignored
+        self.assertEqual(code, 0, out)
+        log = (rbox.Project(self.dirs, proj).target / "buildrs.log").read_text().splitlines()
+        self.assertGreaterEqual(len(log), 1)
+        self.assertEqual(set(log), {"proxy_variable=false relay_reachable=false"},
+                         "the build script saw the proxy at least once")
+        self.assertEqual(len(log), 1, "the build script was re-run by one of the --net commands")
 
     def test_7_nothing_is_left_behind(self):
         import glob

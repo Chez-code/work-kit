@@ -452,12 +452,10 @@ def lane_rust(root: Path, run: Run, stop_mode: bool, deadline: float, file_path:
             "Run rustbox/install.sh from the kit checkout."
         )
         return
-    env = dict(os.environ)
-    env.pop("RBOX_TEST_BASE", None)  # the gate always judges against this machine's real approvals
 
     def cargo(label: str, *args: str) -> bool:
         """Run one cargo command through rbox. True when the lane may carry on."""
-        code, text = sh([rbox, "cargo", *args], root, deadline, run.ran, env=env, shown="cargo " + " ".join(args))
+        code, text = sh([rbox, "cargo", *args], root, deadline, run.ran, shown="cargo " + " ".join(args))
         if code == 0:
             return True
         if code in (RBOX_REFUSED, RBOX_CANNOT_RUN, RBOX_WAITING):

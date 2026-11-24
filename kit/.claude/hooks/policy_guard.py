@@ -17,12 +17,12 @@ Active only when the repo has a Cargo.toml at its root (the same test as the
 gate's Rust lane); everywhere else it exits 0 at once.
 
 Refused (exit 2, the reason on stderr goes back to Claude):
-- Bash: `rbox allow`, `rbox urgent`, `rbox export`, `rbox net allow`
+- Bash: `rbox allow`, `rbox urgent`, `rbox export`, `rbox shell`, `rbox net allow`
 - Bash: typing into another terminal or window (tmux send-keys and
   paste-buffer, screen -X, xdotool, ydotool, wtype)
 - Bash: faking a terminal around rbox (script, expect, unbuffer, socat)
 - Bash: touching rbox's state folder, its toolchain, a build-output folder
-  under its cache, or switching it to a test world
+  under its cache, or running the kit's test-world wrapper
 - Write/Edit/MultiEdit/NotebookEdit: any file inside rbox's own folders
 
 Reading the downloaded crate sources under ~/.cache/rustbox/*/vendor is
@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_log  # noqa: E402
 from bash_guard import _segments, _strip_prefix, _tokens  # noqa: E402
 
-HUMAN_ONLY = {"allow", "urgent", "export"}
+HUMAN_ONLY = {"allow", "urgent", "export", "shell"}
 KEYSTROKE_TOOLS = {"xdotool", "ydotool", "wtype"}
 FAKE_TERMINAL_TOOLS = {"script", "expect", "unbuffer", "socat"}
 OWN_FOLDERS = (".local/state/rustbox", ".local/share/rustbox", ".cache/rustbox")
@@ -55,7 +55,7 @@ ASK = "Only the user can do this, from their own terminal. Tell them what you ne
 _STATE = re.compile(r"\.local/state/rustbox")
 _TOOLCHAIN = re.compile(r"\.local/share/rustbox/toolchains")
 _BUILD_OUTPUT = re.compile(r"\.cache/rustbox/[^\s/'\"]+/target")
-_TEST_WORLD = re.compile(r"\bRBOX_TEST_BASE\b")
+_TEST_WORLD = re.compile(r"rust/world\.py")
 
 
 def is_rbox(word: str) -> bool:
@@ -126,8 +126,8 @@ def check_command(command: str, depth: int = 0) -> str | None:
         return "the Rust toolchain is only run through rbox (use `cargo`, it is boxed)"
     if _BUILD_OUTPUT.search(command):
         return "build output is only run or copied through rbox (`rbox run`, or the user's `rbox export`)"
-    if _TEST_WORLD.search(command) and mentions_rbox:
-        return "a test world has its own approvals, separate from this machine's"
+    if _TEST_WORLD.search(command):
+        return "the kit's test world has its own approvals, separate from this machine's"
     if mentions_rbox and re.search(r"\bCLAUDE(CODE|_CODE_\w+)\b", command):
         return "hiding the Claude session from rbox"
     return None

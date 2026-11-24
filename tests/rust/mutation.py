@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "rustbox"
 import rbox  # noqa: E402
 
 REAL_BUILD_BOX = rbox.build_box
-DIRS = rbox.Dirs(dict(os.environ))
+DIRS = rbox.Dirs()
 
 
 class Everything(set):
@@ -46,8 +46,8 @@ def selftest_with_open_proxy() -> tuple:
 def selftest_with(mutate) -> tuple:
     """(exit code, names of failed probes) with the build box changed by `mutate`."""
 
-    def weakened(dirs, bwrap, toolchain, project, cwd, extra_env=None):
-        box = REAL_BUILD_BOX(dirs, bwrap, toolchain, project, cwd, extra_env)
+    def weakened(dirs, bwrap, toolchain, project, *args, **kwargs):
+        box = REAL_BUILD_BOX(dirs, bwrap, toolchain, project, *args, **kwargs)
         mutate(box, project)
         return box
 
@@ -74,6 +74,11 @@ def allow_nested(box, project):
     box.opts = [o for o in box.opts if o != "--disable-userns"]
 
 
+def proxy_in_sight_while_compiling(box, project):
+    # what compiling inside the network box would look like to a build script
+    box.env["HTTPS_PROXY"] = "http://127.0.0.1:3128"
+
+
 CASES = [
     ("inherit the caller's environment", leak_environment, "read the canary variable (/proc/1/environ)"),
     ("share the machine's network", lambda b, p: b.add("--share-net"), "connect to a service on this machine (TCP)"),
@@ -81,6 +86,7 @@ CASES = [
     ("bind /run", lambda b, p: b.add("--ro-bind", "/run", "/run"), "connect to socket"),
     ("make the project writable", lambda b, p: b.add("--bind", str(p.root), str(p.root)), "write into src/"),
     ("allow nested sandboxes", allow_nested, "create a nested sandbox"),
+    ("let a build see the network proxy", proxy_in_sight_while_compiling, "see the network proxy while compiling"),
 ]
 
 

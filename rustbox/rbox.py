@@ -59,7 +59,7 @@ BUILD_CMDS = {
     "build", "b", "check", "c", "clippy", "test", "t", "bench", "run", "r", "doc", "d",
     "rustc", "rustdoc", "metadata", "tree", "pkgid", "locate-project",
 }
-NET_OK_CMDS = {"test", "t", "run", "r", "bench"}  # the only cargo commands `--net` applies to
+NET_OK_CMDS = {"test", "t", "run", "r"}  # the only cargo commands `--net` applies to
 FETCH_NET_CMDS = {"add", "remove", "rm", "update", "generate-lockfile", "search"}
 SYNC_CMDS = {"fetch", "vendor"}  # both mean: make the vendored copy match the lockfile
 FETCH_LOCAL_CMDS = {"fmt"}
@@ -152,18 +152,18 @@ def read_json(path: Path, default):
 
 
 class Dirs:
-    """Where rbox keeps things. Fixed under the real home so the environment
-    cannot point rbox at someone else's approvals. RBOX_TEST_BASE moves the
-    cache and state into a separate test world; the toolchain stays shared."""
+    """Where rbox keeps things: fixed places under the real home. Nothing in the
+    environment or on the command line can point rbox at another set of
+    approvals. The kit's own tests pass `test_base` in code (tests/rust/world.py)
+    to get a separate world; the installed tool has no switch for that."""
 
-    def __init__(self, env: dict) -> None:
+    def __init__(self, test_base: Path | None = None) -> None:
         self.home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
         self.share = self.home / ".local" / "share" / "rustbox"
-        base = env.get("RBOX_TEST_BASE")
-        self.test_world = bool(base)
-        if base:
-            self.cache = Path(base).resolve() / "cache"
-            self.state = Path(base).resolve() / "state"
+        self.test_world = test_base is not None
+        if test_base is not None:
+            self.cache = Path(test_base).resolve() / "cache"
+            self.state = Path(test_base).resolve() / "state"
         else:
             self.cache = self.home / ".cache" / "rustbox"
             self.state = self.home / ".local" / "state" / "rustbox"
@@ -364,12 +364,12 @@ class Box:
         sys.stderr.flush()
         os.execve(self.bwrap, argv, self.env)
 
-    def run(self, command: list, capture: bool = False, stdin=None) -> subprocess.CompletedProcess:
+    def run(self, command: list, capture: bool = False, stdin=None, capture_stdout: bool = False) -> subprocess.CompletedProcess:
         argv = self.argv(command)
         try:
             return subprocess.run(
                 argv, env=self.env, pass_fds=self.fds, text=True,
-                stdout=subprocess.PIPE if capture else None,
+                stdout=subprocess.PIPE if (capture or capture_stdout) else None,
                 stderr=subprocess.PIPE if capture else None,
                 stdin=stdin,
             )
@@ -559,8 +559,15 @@ def cooldown_pins(mode: str = "deny") -> list:
     ]
 
 
-def build_box(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Path, extra_env: dict | None = None) -> Box:
-    """Crate code may run here: no network, project read-only, vendored crates only."""
+def build_box(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Path,
+              extra_env: dict | None = None, writable: list | None = None) -> Box:
+    """Crate code may run here: no network, project read-only, vendored crates only.
+
+    `writable` folders (`rbox run --rw`) are mounted first and the hiding is
+    applied last, over everything. A mount covers whatever was mounted under
+    it before, so hiding first and mounting a folder afterwards would bring
+    that folder's .env, .git and .claude back into view.
+    """
     project.prepare()
     box = Box(bwrap)
     box.system(full=True)
@@ -569,7 +576,14 @@ def build_box(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Pa
     box.add("--ro-bind", str(project.vendor), "/rbox/vendor")
     box.add("--bind", str(project.target), "/rbox/target")
     box.add("--ro-bind", str(project.root), str(project.root))
+    outside = []
+    for path in writable or []:
+        box.add("--bind", str(path), str(path))
+        if not inside(Path(path), project.root):
+            outside.append(Path(path))
     hide_secrets(box, project.root)
+    for path in outside:
+        hide_secrets(box, path)
     box.env.update({
         "PATH": "/rbox/toolchain/bin:/usr/bin:/bin",
         "CARGO_TARGET_DIR": "/rbox/target",
@@ -1122,7 +1136,8 @@ def cmd_cargo(dirs: Dirs, args: list, net: bool, extra_env: dict) -> int:
         raise refuse(f"`cargo {sub}` is not a command rbox knows", "rbox runs cargo's own commands only, no plugins")
     check_flags(sub, leading, rest)
     if net and sub not in NET_OK_CMDS:
-        raise refuse(f"`--net` applies to test, run and bench only, not to `cargo {sub}`")
+        raise refuse(f"`--net` applies to `cargo test` and `cargo run` only, not to `cargo {sub}`",
+                     "compiling never gets the network; only finished test programs and binaries do")
     leading = strip_lock_flags(leading)
     rest = strip_lock_flags(rest)
     if sub == "search":
@@ -1150,11 +1165,119 @@ def cmd_cargo(dirs: Dirs, args: list, net: bool, extra_env: dict) -> int:
         else:
             require_approved(dirs, project)
     if net:
-        return run_with_network(dirs, bwrap, toolchain, project, cwd,
-                                [CARGO, *leading, sub, "--locked", *SOURCE_PINS, *rest], extra_env)
+        return net_cargo(dirs, bwrap, toolchain, project, cwd, leading, sub, rest, extra_env)
     box = build_box(dirs, bwrap, toolchain, project, cwd, extra_env)
     box.exec([CARGO, *leading, sub, "--locked", *SOURCE_PINS, *rest])
     return 0
+
+
+# cargo flags that take a value, so the word after them is not a test name or a program argument
+VALUE_FLAGS = {
+    "-p", "--package", "--exclude", "--bin", "--example", "--test", "--bench", "--features", "-F",
+    "--target", "--profile", "-j", "--jobs", "--manifest-path", "--color", "--message-format",
+}
+
+RUNTESTS_SOURCE = r"""
+import json, os, subprocess, sys
+
+# Runs test programs that are already built, the way `cargo test` would: one after
+# the other, each from its package folder. No cargo here, so nothing gets compiled.
+with open("/rbox/tests.json") as f:
+    programs = json.load(f)
+failed = 0
+for program in programs:
+    sys.stderr.write("     Running " + program["label"] + " (" + program["exe"] + ")\n")
+    sys.stderr.flush()
+    folder = os.path.dirname(program["exe"])
+    env = dict(os.environ, CARGO_MANIFEST_DIR=program["cwd"])
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(p for p in (folder, os.path.dirname(folder), env.get("LD_LIBRARY_PATH", "")) if p)
+    if subprocess.run([program["exe"], *sys.argv[1:]], cwd=program["cwd"], env=env).returncode != 0:
+        failed += 1
+sys.exit(101 if failed else 0)
+"""
+
+
+def split_selection(rest: list) -> tuple:
+    """(cargo's own flags, bare words, everything after `--`) from what follows a subcommand."""
+    head = before_dashdash(rest)
+    tail = rest[len(head) + 1:]
+    flags, words = [], []
+    i = 0
+    while i < len(head):
+        token = head[i]
+        if token in VALUE_FLAGS and i + 1 < len(head):
+            if token != "--message-format":
+                flags += [token, head[i + 1]]
+            i += 2
+            continue
+        if token.startswith("--message-format="):
+            pass
+        elif token.startswith("-"):
+            flags.append(token)
+        else:
+            words.append(token)
+        i += 1
+    return flags, words, tail
+
+
+def compile_offline(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Path,
+                    command: list, extra_env: dict, quiet: bool) -> tuple:
+    """Run a cargo build in the build box, which has no network, and report the programs
+    it produced: (exit code, cargo's artifact messages that name an executable)."""
+    box = build_box(dirs, bwrap, toolchain, project, cwd, extra_env)
+    done = box.run(command, capture=quiet, capture_stdout=True)
+    programs = []
+    for line in (done.stdout or "").splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(message, dict) and message.get("reason") == "compiler-artifact" and message.get("executable"):
+            programs.append(message)
+    return done.returncode, programs
+
+
+def net_cargo(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Path,
+              leading: list, sub: str, rest: list, extra_env: dict, quiet: bool = False) -> int:
+    """`rbox --net cargo test|run`. Compiling never gets the network: cargo builds in the
+    ordinary build box first, and only the finished test programs or binary are then run
+    with the proxy. Build scripts and proc macros therefore never see it, and cargo is
+    not run again in the network box, so nothing can be made to recompile there."""
+    if not load_net_allow(project):
+        raise refuse(
+            "this project has no hosts on its network list, so `--net` has nothing to reach",
+            "the user adds one in their own terminal: rbox net allow HOST:PORT",
+        )
+    flags, words, tail = split_selection(rest)
+    testing = sub in ("test", "t")
+    only_build = "--no-run" in flags
+    flags = [flag for flag in flags if flag != "--no-run"]
+    build = ["test", "--no-run"] if testing else ["build"]
+    code, programs = compile_offline(
+        dirs, bwrap, toolchain, project, cwd,
+        [CARGO, *leading, *build, "--locked", *SOURCE_PINS, "--message-format=json-render-diagnostics", *flags],
+        extra_env, quiet)
+    if code != 0 or only_build:
+        return code
+    if testing:
+        tests = [p for p in programs if (p.get("profile") or {}).get("test")]
+        if not tests:
+            say("rbox: no test programs were built")
+            return 0
+        spec = [{"exe": p["executable"], "cwd": str(Path(p["manifest_path"]).parent),
+                 "label": f"{p['target']['name']} ({', '.join(p['target']['kind'])})"} for p in tests]
+        if not quiet:
+            say("rbox: compiled without network; now running the test programs with it (doc tests are not run with --net)")
+        return run_with_network(dirs, bwrap, toolchain, project, cwd,
+                                ["/usr/bin/python3", "-I", "/rbox/runtests.py", *words, *tail], extra_env, quiet=quiet,
+                                data={"/rbox/tests.json": json.dumps(spec), "/rbox/runtests.py": RUNTESTS_SOURCE})
+    binaries = [p for p in programs
+                if not (p.get("profile") or {}).get("test") and {"bin", "example"} & set(p["target"]["kind"])]
+    if len(binaries) != 1:
+        names = ", ".join(sorted(p["target"]["name"] for p in binaries)) or "none"
+        raise refuse(f"`cargo run` could not tell which program to run (built: {names})", "say which: --bin NAME")
+    return run_with_network(dirs, bwrap, toolchain, project, cwd,
+                            [binaries[0]["executable"], *words, *tail], extra_env, quiet=quiet)
 
 
 def _empty_dir(dirs: Dirs) -> Path:
@@ -1430,7 +1553,10 @@ class Proxy:
 
 
 def run_with_network(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Path,
-                     command: list, extra_env: dict, binds: list | None = None, quiet: bool = False) -> int:
+                     command: list, extra_env: dict, binds: list | None = None, quiet: bool = False,
+                     data: dict | None = None) -> int:
+    """Run `command`, which must already be built, with the proxy. Never hand this a cargo
+    command that compiles: see net_cargo."""
     allow = load_net_allow(project)
     if not allow:
         raise refuse(
@@ -1442,12 +1568,12 @@ def run_with_network(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, 
     proxy = None
     try:
         proxy = Proxy(os.path.join(runtime, "proxy.sock"), allow, project.state / "net.log")
-        box = build_box(dirs, bwrap, toolchain, project, cwd, extra_env)
-        for path in binds or []:
-            box.add("--bind", str(path), str(path))
+        box = build_box(dirs, bwrap, toolchain, project, cwd, extra_env, writable=binds)
         box.add("--ro-bind", os.path.join(runtime, "proxy.sock"), "/rbox/proxy.sock")
         box.add("--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs")
         box.data("/rbox/relay.py", RELAY_SOURCE)
+        for dest, content in (data or {}).items():
+            box.data(dest, content)
         address = f"http://127.0.0.1:{PROXY_PORT}"
         box.env.update({
             "HTTPS_PROXY": address, "https_proxy": address, "ALL_PROXY": address, "all_proxy": address,
@@ -1793,7 +1919,7 @@ def cmd_run(dirs: Dirs, args: list, net: bool, extra_env: dict) -> int:
             raise refuse(f"--rw {raw}: not an existing folder")
         if inside(path, project.root):
             relative = path.relative_to(project.root).parts
-            if path == project.root or (relative and relative[0] in (".git", ".claude", ".cargo")):
+            if path == project.root or any(part in HIDE_DIRS or part == ".cargo" for part in relative):
                 raise refuse(f"--rw {raw}: that part of the project stays read-only")
         else:
             for own in (dirs.share, dirs.cache, dirs.state):
@@ -1805,9 +1931,7 @@ def cmd_run(dirs: Dirs, args: list, net: bool, extra_env: dict) -> int:
         binds.append(path)
     if net:
         return run_with_network(dirs, bwrap, toolchain, project, cwd, command, extra_env, binds)
-    box = build_box(dirs, bwrap, toolchain, project, cwd, extra_env)
-    for path in binds:
-        box.add("--bind", str(path), str(path))
+    box = build_box(dirs, bwrap, toolchain, project, cwd, extra_env, writable=binds)
     box.exec(command)
     return 0
 
@@ -1890,7 +2014,12 @@ def cmd_new(dirs: Dirs, args: list) -> int:
 
 
 def cmd_shell(dirs: Dirs, args: list) -> int:
+    """A shell inside the build box, for a person to look around. cargo typed in that
+    shell runs without the settings rbox pins on its own cargo commands, so the shell
+    is not offered to sessions, and it opens only when every crate is approved."""
+    require_human("shell")
     bwrap, toolchain, project = open_project(dirs)
+    require_approved(dirs, project)
     cwd = Path.cwd().resolve()
     box = build_box(dirs, bwrap, toolchain, project, cwd if inside(cwd, project.root) else project.root)
     box.env["PS1"] = "(rbox) $ "
@@ -1906,12 +2035,15 @@ def named_env(name: str) -> dict:
 
 # ---------------------------------------------------------------- selftest
 
-SELFTEST_STAGES = ("build-script", "proc-macro", "test", "run", "run-net")
-SELFTEST_NET_PROBES = [  # only in the `run-net` stage
+SELFTEST_STAGES = ("build-script", "proc-macro", "test-net", "test", "run", "run-net")
+SELFTEST_NET_STAGES = ("test-net", "run-net")
+SELFTEST_COMPILE_STAGES = ("build-script", "proc-macro")
+SELFTEST_NET_PROBES = [  # only where the program was given `--net`
     "control: the listed host is reachable through the proxy",
     "reach an unlisted host through the proxy",
     "reach an unlisted service on this machine through the proxy",
 ]
+SELFTEST_COMPILE_PROBES = ["see the network proxy while compiling"]  # only in the stages that run during a build
 SELFTEST_PROBES = [
     "read a file in your home folder",
     "see your home folder",
@@ -2068,33 +2200,51 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
         if do_sync(dirs, bwrap, toolchain, project, quiet=True) != 0:
             raise cannot_run("self-test could not prepare its scratch project")
         logs = []
-        for step in (["build"], ["test"], ["run"]):
-            box = build_box(dirs, bwrap, toolchain, project, root)
-            done = box.run([CARGO, step[0], "--locked", *SOURCE_PINS, "--quiet"], capture=True)
-            logs.append((step[0], done.returncode, done.stderr[-1500:]))
-        time.sleep(0.1)
-        plain_hits = dict(hits)  # nothing may have reached the host listeners so far
-        # the same program once more, now with `--net` and exactly one host listed: our own listener
-        project.prepare()
-        write_atomic(project.state / "net-allow", f"127.0.0.1:{tcp.getsockname()[1]} selftest\n")
-        code = run_with_network(dirs, bwrap, toolchain, project, root, ["/rbox/target/debug/hostile", "run-net"], {}, quiet=True)
-        logs.append(("run --net", code, ""))
-        time.sleep(0.1)
-
         results: dict = {}
-        for stage in SELFTEST_STAGES:
-            entries = {}
+
+        def collect(stage: str, written_as: str = "") -> None:
+            """Read what a stage recorded. A LEAKED from an earlier read of the same stage is kept."""
+            entries = dict(results.get(stage, {}))
+            path = project.target / "selftest" / f"{written_as or stage}.txt"
             try:
-                for line in (project.target / "selftest" / f"{stage}.txt").read_text(encoding="utf-8").splitlines():
+                for line in path.read_text(encoding="utf-8").splitlines():
                     fields = line.split("\t")
-                    if len(fields) >= 2:
+                    if len(fields) >= 2 and entries.get(fields[0], ("",))[0] != "LEAKED":
                         entries[fields[0]] = (fields[1], fields[2] if len(fields) > 2 else "")
+                if written_as:
+                    path.unlink()
             except OSError:
                 pass
             results[stage] = entries
 
+        # exactly one host on the list: our own listener
+        project.prepare()
+        write_atomic(project.state / "net-allow", f"127.0.0.1:{tcp.getsockname()[1]} selftest\n")
+        # 1. `--net cargo test` on a cold project: everything is compiled here, and it has to be
+        #    compiled without the network. Only the finished test program may reach the proxy.
+        code = net_cargo(dirs, bwrap, toolchain, project, root, [], "test", [], {}, quiet=True)
+        logs.append(("test --net", code, ""))
+        for stage in SELFTEST_COMPILE_STAGES:
+            collect(stage)
+        collect("test-net", written_as="test")
+        # 2. the plain commands
+        for step in (["build"], ["test"], ["run"]):
+            box = build_box(dirs, bwrap, toolchain, project, root)
+            done = box.run([CARGO, step[0], "--locked", *SOURCE_PINS, "--quiet"], capture=True)
+            logs.append((step[0], done.returncode, done.stderr[-1500:]))
+        collect("test")
+        collect("run")
+        # 3. the built program with `--net`
+        code = run_with_network(dirs, bwrap, toolchain, project, root, ["/rbox/target/debug/hostile", "run-net"], {}, quiet=True)
+        logs.append(("run --net", code, ""))
+        collect("run-net")
+        for stage in SELFTEST_COMPILE_STAGES:
+            collect(stage)  # again: had a later step re-run the build with the proxy in sight, it shows here
+        time.sleep(0.1)
+
         # what really happened on the host
         def host_changed(name: str, stage: str) -> bool:
+            stage = "test" if stage == "test-net" else stage  # the test program names its files "test" either way
             checks = {
                 "write into src/": (root / "src" / f"rbox_probe_{stage}.rs").exists(),
                 "append to Cargo.toml": sha256_file(root / "Cargo.toml") != manifest_before,
@@ -2106,24 +2256,32 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             }
             return checks.get(name, False)
 
-        expected = SELFTEST_PROBES + [f"connect to socket {p}" for p in sockets] + SELFTEST_NET_PROBES
-        if hits["tcp"] != plain_hits["tcp"] + 1:
-            broken_net = f"the proxy passed {hits['tcp'] - plain_hits['tcp']} connections to the listed host (expected exactly 1)"
-        else:
-            broken_net = ""
+        base = SELFTEST_PROBES + [f"connect to socket {p}" for p in sockets]
+        expected = base + SELFTEST_NET_PROBES + SELFTEST_COMPILE_PROBES
+
+        def stages_for(name: str) -> tuple:
+            if name in SELFTEST_NET_PROBES:
+                return SELFTEST_NET_STAGES
+            if name in SELFTEST_COMPILE_PROBES:
+                return SELFTEST_COMPILE_STAGES
+            return SELFTEST_STAGES
+
+        # the listed host must have been reached exactly twice: once by each `--net` stage's control
+        through = hits["tcp"] - baseline["tcp"]
+        broken_net = "" if through == len(SELFTEST_NET_STAGES) else (
+            f"the listed host saw {through} connections; exactly {len(SELFTEST_NET_STAGES)} were expected, "
+            "one from each stage that was given --net")
         leaked, broken, lines = [], [], []
         for name in expected:
             verdicts = []
-            for stage in SELFTEST_STAGES:
+            for stage in stages_for(name):
                 status, detail = results[stage].get(name, ("MISSING", "the probe did not run"))
                 if status == "INBOX":
                     status = "LEAKED" if host_changed(name, stage) else "BLOCKED"
-                if name == "connect to a service on this machine (TCP)" and plain_hits["tcp"] > baseline["tcp"]:
+                if name == "connect to a service on this machine (TCP)" and through > len(SELFTEST_NET_STAGES):
                     status = "LEAKED"
                 if name == "connect to an abstract socket on this machine" and hits["abstract"] > 0:
                     status = "LEAKED"
-                if stage != "run-net" and name in SELFTEST_NET_PROBES:
-                    continue
                 if name == "reach an unlisted service on this machine through the proxy" and hits["unlisted"] > 0:
                     status = "LEAKED"
                 if name == f"connect to socket {own_socket}" and hits["path"] > 0:
@@ -2146,7 +2304,7 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             lines.append(f"  FAILED   {broken_net}")
             broken.append("proxy connection count")
         sys.stdout.write("\n".join(lines) + "\n")
-        total = (len(expected) - len(SELFTEST_NET_PROBES)) * len(SELFTEST_STAGES) + len(SELFTEST_NET_PROBES)
+        total = sum(len(stages_for(name)) for name in expected)
         if leaked or broken:
             for step, code, tail in logs:
                 if code != 0:
@@ -2155,7 +2313,7 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             return 1
         sys.stdout.write(
             f"\nrbox selftest: passed. {total} checks across {len(SELFTEST_STAGES)} stages "
-            f"(build script, proc macro, test, program, program with --net), nothing leaked.\n"
+            f"(build script, proc macro, test, program, and test and program with --net), nothing leaked.\n"
         )
         return 0
     finally:
@@ -2330,11 +2488,11 @@ def die_with_caller() -> None:
         os._exit(1)  # the caller went away in between
 
 
-def main(argv: list) -> int:
+def main(argv: list, dirs: Dirs | None = None) -> int:
     die_with_caller()
-    dirs = Dirs(dict(os.environ))
+    dirs = dirs or Dirs()
     if dirs.test_world:
-        say("rbox: note: test world (RBOX_TEST_BASE); approvals here are not this machine's")
+        say("rbox: note: test world; approvals here are not this machine's")
     args = argv[1:]
     if os.path.basename(argv[0]) == "cargo":
         return cmd_cargo(dirs, args, False, {})
@@ -2367,13 +2525,18 @@ def main(argv: list) -> int:
     raise refuse(f"`rbox {command}` is not a command", "see `rbox help`")
 
 
-if __name__ == "__main__":
+def cli(argv: list, dirs: Dirs | None = None) -> int:
+    """main() with rbox's own stops turned into a message and an exit code."""
     try:
-        sys.exit(main(sys.argv))
+        return main(argv, dirs)
     except Stop as stop:
         say(f"rbox: {KIND.get(stop.code, 'error')}: {stop.message}")
         if stop.hint:
             say(f"      {stop.hint}")
-        sys.exit(stop.code)
+        return stop.code
     except KeyboardInterrupt:
-        sys.exit(130)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(cli(sys.argv))

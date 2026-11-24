@@ -35,7 +35,7 @@ class World:
     def __init__(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name).resolve()
-        self.dirs = rbox.Dirs({"RBOX_TEST_BASE": str(base / "world")})
+        self.dirs = rbox.Dirs(test_base=base / "world")
         self.dirs.home = base / "home"
         self.dirs.share = self.dirs.home / ".local" / "share" / "rustbox"
         self.toolchain = self.dirs.share / "toolchains" / "1.100.0"
@@ -143,6 +143,13 @@ class CargoArguments(unittest.TestCase):
         self.assertEqual(rbox.strip_lock_flags(["--locked", "-p", "x", "--offline", "--", "--locked"]),
                          ["-p", "x", "--", "--locked"])
 
+    def test_selection_flags_words_and_program_arguments(self):
+        self.assertEqual(rbox.split_selection(["-p", "feed", "live_", "--release", "--", "--ignored", "-p"]),
+                         (["-p", "feed", "--release"], ["live_"], ["--ignored", "-p"]))
+        self.assertEqual(rbox.split_selection(["--bin", "recorder"]), (["--bin", "recorder"], [], []))
+        self.assertEqual(rbox.split_selection(["--message-format", "json", "--message-format=short", "x"]), ([], ["x"], []))
+        self.assertEqual(rbox.split_selection([]), ([], [], []))
+
     def test_every_command_has_exactly_one_home(self):
         groups = [rbox.BUILD_CMDS, rbox.FETCH_NET_CMDS, rbox.SYNC_CMDS, rbox.FETCH_LOCAL_CMDS, set(rbox.REFUSED_CMDS)]
         for i, a in enumerate(groups):
@@ -151,7 +158,7 @@ class CargoArguments(unittest.TestCase):
         for name in ("metadata", "fetch", "generate-lockfile", "tree", "locate-project", "fmt", "vendor"):
             self.assertTrue(any(name in g for g in groups), name)
         self.assertTrue(rbox.NET_OK_CMDS <= rbox.BUILD_CMDS)
-        for name in ("build", "check", "clippy", "doc"):
+        for name in ("build", "check", "clippy", "doc", "bench", "rustc"):
             self.assertNotIn(name, rbox.NET_OK_CMDS)
 
     def test_manifest_path(self):
@@ -279,6 +286,38 @@ class Boxes(unittest.TestCase):
             self.assertIn(str(self.w.root / ".mcp.json"), null)
             self.assertIn(str(self.w.root / "deep" / "er" / ".env.production"), null)
             self.assertNotIn(str(self.w.root / "target" / "x" / ".env"), null)
+
+    def test_a_writable_folder_is_mounted_before_the_hiding_never_after(self):
+        # a later mount covers earlier ones beneath it: hiding has to come last
+        sub = self.w.root / "sub"
+        (sub / ".git").mkdir(parents=True)
+        (sub / ".env").write_text("K=1")
+        (sub / "deeper").mkdir()
+        (sub / "deeper" / ".env.local").write_text("K=2")
+        box = rbox.build_box(self.w.dirs, "/usr/bin/bwrap", self.w.toolchain, self.w.project, self.w.root, None, [sub])
+        self.w.boxes.append(box)
+        opts = box.opts
+
+        def position(*triple) -> int:
+            for i in range(len(opts) - len(triple) + 1):
+                if tuple(opts[i:i + len(triple)]) == triple:
+                    return i
+            self.fail(f"{triple} not in the box options")
+
+        mounted = position("--bind", str(sub), str(sub))
+        self.assertLess(mounted, position("--ro-bind", "/dev/null", str(sub / ".env")))
+        self.assertLess(mounted, position("--ro-bind", "/dev/null", str(sub / "deeper" / ".env.local")))
+        self.assertLess(mounted, position("--tmpfs", str(sub / ".git")))
+        self.assertLess(position("--ro-bind", str(self.w.root), str(self.w.root)), mounted)
+
+    def test_a_writable_folder_outside_the_project_gets_the_same_hiding(self):
+        outside = self.w.root.parent / "tapes"
+        (outside / ".git").mkdir(parents=True)
+        (outside / ".env").write_text("K=1")
+        box = rbox.build_box(self.w.dirs, "/usr/bin/bwrap", self.w.toolchain, self.w.project, self.w.root, None, [outside])
+        self.w.boxes.append(box)
+        self.assertIn(str(outside / ".git"), singles(box.opts, "--tmpfs"))
+        self.assertIn(str(outside / ".env"), [dest for src, dest in pairs(box.opts, "--ro-bind") if src == "/dev/null"])
 
     def test_git_worktree_pointer_file_is_left_alone(self):
         (self.w.root / ".git").write_text("gitdir: /elsewhere\n")
@@ -572,16 +611,28 @@ class SmallThings(unittest.TestCase):
                 self.assertIn(part + version, names)
 
     def test_test_world_moves_state_and_cache_only(self):
-        real = rbox.Dirs({})
-        world = rbox.Dirs({"RBOX_TEST_BASE": "/tmp/somewhere"})
+        real = rbox.Dirs()
+        world = rbox.Dirs(test_base=Path("/tmp/somewhere"))
         self.assertTrue(world.test_world and not real.test_world)
         self.assertEqual(world.share, real.share)
         self.assertNotEqual(world.confirmed, real.confirmed)
 
-    def test_dirs_ignore_xdg_overrides(self):
-        os.environ["XDG_STATE_HOME"] = "/tmp/attacker-state"
-        self.addCleanup(os.environ.pop, "XDG_STATE_HOME", None)
-        self.assertNotIn("attacker", str(rbox.Dirs(dict(os.environ)).confirmed))
+    def test_nothing_in_the_environment_moves_the_approvals(self):
+        # the old RBOX_TEST_BASE switch is gone, and XDG overrides were never honoured
+        real = rbox.Dirs()
+        for name in ("RBOX_TEST_BASE", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "HOME"):
+            os.environ, saved = dict(os.environ, **{name: "/tmp/attacker"}), os.environ
+            try:
+                moved = rbox.Dirs()
+            finally:
+                os.environ = saved
+            self.assertEqual((moved.confirmed, moved.cache, moved.share, moved.test_world),
+                             (real.confirmed, real.cache, real.share, False), name)
+
+    def test_the_command_line_has_no_world_switch(self):
+        source = Path(rbox.__file__).read_text()
+        self.assertNotIn("RBOX_TEST_BASE", source)
+        self.assertNotIn("environ.get(\"RBOX", source)
 
 
 if __name__ == "__main__":

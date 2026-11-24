@@ -4,6 +4,7 @@
       "Bash(rbox allow:*)",
       "Bash(rbox urgent:*)",
       "Bash(rbox export:*)",
+      "Bash(rbox shell:*)",
       "Bash(rbox net allow:*)",
       "Edit(~/.local/state/rustbox/**)",
       "Edit(~/.local/share/rustbox/**)",

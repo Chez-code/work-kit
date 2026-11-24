@@ -144,6 +144,16 @@ pub fn run(stage: &str) {
     r.write_attempt("write into /usr", &format!("/usr/rbox_probe_{stage}"), &marker, false);
     r.write_attempt("write into your home folder", &format!("{HOME}/rbox_probe_{NONCE}_{stage}"), &marker, false);
 
+    // ---- while compiling there must be no proxy in sight, even when the user asked for `--net`
+    if stage == "build-script" || stage == "proc-macro" {
+        let seen: Vec<&str> = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "RBOX_PROXY"]
+            .into_iter()
+            .filter(|name| std::env::var(name).is_ok())
+            .collect();
+        let relay = tcp("127.0.0.1:3128").0;
+        r.attack("see the network proxy while compiling", !seen.is_empty() || relay, &format!("variables: {seen:?}, relay reachable: {relay}"));
+    }
+
     // ---- only with `--net`: the proxy must pass the listed host and nothing else
     if let Ok(proxy) = std::env::var("HTTPS_PROXY") {
         let proxy = proxy.trim_start_matches("http://").to_string();

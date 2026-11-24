@@ -238,7 +238,7 @@ fi
 RSHIM="$WORK/rshim"; mkdir -p "$RSHIM"
 export GATE_RBOX="$RSHIM/rbox"
 rbox_shim() { # rbox_shim <<'SH' ... SH  — body sees $1=cargo $2=<subcommand>
-  { printf '#!/bin/sh\necho "$*" >> "%s/calls.log"\nenv | grep -c "^RBOX_TEST_BASE=" >> "%s/testbase.log"\n' "$RSHIM" "$RSHIM"; cat; } > "$RSHIM/rbox"
+  { printf '#!/bin/sh\necho "$*" >> "%s/calls.log"\n' "$RSHIM"; cat; } > "$RSHIM/rbox"
   chmod +x "$RSHIM/rbox"
 }
 rbox_ok() { rbox_shim <<'SH'
@@ -275,8 +275,6 @@ gate_in "$RR" "$(stop "$RR")" --stop
 assert_eq "$RC" 0 "rust stop green exits 0"
 assert_eq "$(awk '{print $2}' "$RSHIM/calls.log" | tr '\n' ' ')" "fmt clippy test " "stop runs fmt, clippy, test in that order"
 assert_has "$(cat "$RSHIM/calls.log")" "clippy --workspace --all-targets --message-format=short -- -D warnings" "clippy denies warnings"
-RBOX_TEST_BASE=/tmp/fake-world gate_in "$RR" "$(edit "$RR" src/main.rs)"
-assert_eq "$(tail -n 1 "$RSHIM/testbase.log")" 0 "the gate never passes a test world to rbox"
 
 # Real captures, cargo 1.100, --message-format=short
 rbox_shim <<'SH'

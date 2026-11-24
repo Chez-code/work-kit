@@ -308,6 +308,8 @@ class PolicyGuard(unittest.TestCase):
         "/home/u/.local/bin/rbox allow",
         "rbox urgent serde@1.0.230",
         "rbox export recorder --release --to /tmp/out",
+        "rbox shell",
+        "rbox shell -c 'cargo build'",
         "rbox net allow api.example.com:443",
         "FOO=1 rbox allow",
         "timeout 5 rbox allow",
@@ -328,7 +330,8 @@ class PolicyGuard(unittest.TestCase):
         "~/.local/share/rustbox/toolchains/1.100.0/bin/cargo build",
         "~/.cache/rustbox/30f4387b4995d73b/target/debug/app --live",
         "cp ~/.cache/rustbox/30f4387b4995d73b/target/release/app /tmp/",
-        "RBOX_TEST_BASE=/tmp/w rbox cargo build",
+        "python3 ~/work-kit/tests/rust/world.py /tmp/w cargo build",
+        "~/work-kit/tests/rust/world.py /tmp/w allow",
         "find . -name x -exec rbox allow ;",
     ]
     ALLOWED = [
