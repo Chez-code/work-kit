@@ -94,6 +94,9 @@ def main() -> int:
     print(f"unchanged box: exit {code}, {len(failed)} probes failed")
     bad = code != 0
     for label, mutate, must_catch in CASES:
+        if label == "bind /run" and not rbox.host_sockets(DIRS):
+            print(f"skipped  {label}: this machine has no sockets under /run to expose (a bare container)")
+            continue
         code, failed = selftest_with(mutate)
         caught = code != 0 and any(must_catch in name for name in failed)
         print(f"{'caught  ' if caught else 'MISSED  '} {label}: exit {code}, {len(failed)} probes failed")

@@ -2004,9 +2004,16 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             hits[key] += 1
             conn.close()
 
-    for listener, key in ((tcp, "tcp"), (unix, "abstract"), (unlisted, "unlisted")):
+    # a path socket of our own in the home folder, so there is always one to test against
+    own_socket = dirs.home / ".cache" / f"rbox-selftest-{nonce}.sock"
+    own_socket.parent.mkdir(parents=True, exist_ok=True)
+    pathsock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    pathsock.bind(str(own_socket))
+    pathsock.listen(8)
+    hits["path"] = 0
+    for listener, key in ((tcp, "tcp"), (unix, "abstract"), (unlisted, "unlisted"), (pathsock, "path")):
         threading.Thread(target=accept, args=(listener, key), daemon=True).start()
-    sockets = host_sockets(dirs)
+    sockets = [str(own_socket)] + host_sockets(dirs)
     has_tty = True
     try:
         os.close(os.open("/dev/tty", os.O_RDWR))
@@ -2047,7 +2054,7 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
         if baseline["tcp"] != 1:
             raise cannot_run("self-test could not set up its own listener")
 
-        say(f"rbox selftest: hostile crate in {root} ({len(sockets)} sockets on this machine to test against)")
+        say(f"rbox selftest: hostile crate in {root} ({len(sockets) - 1} of this machine's sockets to test against, plus one of its own)")
         if do_sync(dirs, bwrap, toolchain, project, quiet=True) != 0:
             raise cannot_run("self-test could not prepare its scratch project")
         logs = []
@@ -2109,6 +2116,8 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
                     continue
                 if name == "reach an unlisted service on this machine through the proxy" and hits["unlisted"] > 0:
                     status = "LEAKED"
+                if name == f"connect to socket {own_socket}" and hits["path"] > 0:
+                    status = "LEAKED"
                 verdicts.append((stage, status, detail))
             statuses = {status for _, status, _ in verdicts}
             control = name.startswith("control:")
@@ -2144,6 +2153,11 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
         tcp.close()
         unix.close()
         unlisted.close()
+        pathsock.close()
+        try:
+            own_socket.unlink()
+        except OSError:
+            pass
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(project.cache, ignore_errors=True)
         shutil.rmtree(project.state, ignore_errors=True)
