@@ -74,6 +74,28 @@ fn tcp(target: &str) -> (bool, String) {
     }
 }
 
+// CONNECT through the in-box proxy; true only when the tunnel was opened.
+fn through_proxy(proxy: &str, target: &str) -> (bool, String) {
+    let mut stream = match TcpStream::connect(proxy) {
+        Ok(s) => s,
+        Err(err) => return (false, format!("no proxy: {err}")),
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+    if let Err(err) = write!(stream, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n") {
+        return (false, err.to_string());
+    }
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") && head.len() < 4096 {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => break,
+        }
+    }
+    let status = String::from_utf8_lossy(&head).lines().next().unwrap_or("no answer").to_string();
+    (status.contains(" 200 "), status)
+}
+
 pub fn run(stage: &str) {
     let mut r = Report { lines: Vec::new() };
     let marker = format!("{CANARY}-{stage}\n");
@@ -121,6 +143,17 @@ pub fn run(stage: &str) {
     r.write_attempt("write into the toolchain", &format!("/rbox/toolchain/bin/rbox_probe_{stage}"), &marker, false);
     r.write_attempt("write into /usr", &format!("/usr/rbox_probe_{stage}"), &marker, false);
     r.write_attempt("write into your home folder", &format!("{HOME}/rbox_probe_{NONCE}_{stage}"), &marker, false);
+
+    // ---- only with `--net`: the proxy must pass the listed host and nothing else
+    if let Ok(proxy) = std::env::var("HTTPS_PROXY") {
+        let proxy = proxy.trim_start_matches("http://").to_string();
+        let (ok, detail) = through_proxy(&proxy, HOST_TCP);
+        r.control("control: the listed host is reachable through the proxy", ok, &detail);
+        let (ok, detail) = through_proxy(&proxy, "1.1.1.1:443");
+        r.attack("reach an unlisted host through the proxy", ok, &detail);
+        let (ok, detail) = through_proxy(&proxy, HOST_TCP_UNLISTED);
+        r.attack("reach an unlisted service on this machine through the proxy", ok, &detail);
+    }
 
     // ---- terminal and nesting
     let tty = fs::OpenOptions::new().read(true).write(true).open("/dev/tty");

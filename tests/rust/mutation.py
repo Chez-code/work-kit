@@ -21,6 +21,28 @@ REAL_BUILD_BOX = rbox.build_box
 DIRS = rbox.Dirs(dict(os.environ))
 
 
+class Everything(set):
+    """A network list that claims to contain every host."""
+
+    def __contains__(self, item) -> bool:
+        return True
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __iter__(self):
+        return iter(["(everything)"])
+
+
+def selftest_with_open_proxy() -> tuple:
+    real = rbox.load_net_allow
+    rbox.load_net_allow = lambda project: Everything()
+    try:
+        return selftest_with(lambda box, project: None)
+    finally:
+        rbox.load_net_allow = real
+
+
 def selftest_with(mutate) -> tuple:
     """(exit code, names of failed probes) with the build box changed by `mutate`."""
 
@@ -76,6 +98,10 @@ def main() -> int:
         caught = code != 0 and any(must_catch in name for name in failed)
         print(f"{'caught  ' if caught else 'MISSED  '} {label}: exit {code}, {len(failed)} probes failed")
         bad = bad or not caught
+    code, failed = selftest_with_open_proxy()
+    caught = code != 0 and any("unlisted service on this machine through the proxy" in name for name in failed)
+    print(f"{'caught  ' if caught else 'MISSED  '} a proxy that lets every host through: exit {code}, {len(failed)} probes failed")
+    bad = bad or not caught
     print("mutation check: FAILED" if bad else "mutation check: every weakening was caught")
     return 1 if bad else 0
 

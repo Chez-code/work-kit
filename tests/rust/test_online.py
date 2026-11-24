@@ -442,5 +442,197 @@ class Online(unittest.TestCase):
         self.assertFalse(running(), "the boxed program outlived its caller")
 
 
+NETPROBE_RS = r"""use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+
+fn proxy() -> String {
+    std::env::var("HTTPS_PROXY").unwrap_or_default().trim_start_matches("http://").to_string()
+}
+
+// The short CONNECT step a raw TCP or WebSocket client needs to go through the proxy.
+fn connect_via_proxy(target: &str) -> Result<TcpStream, String> {
+    let mut stream = TcpStream::connect(proxy()).map_err(|e| format!("no proxy: {e}"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(20))).map_err(|e| e.to_string())?;
+    write!(stream, "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").map_err(|e| e.to_string())?;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return Err("proxy closed the connection".to_string()),
+        }
+    }
+    let status = String::from_utf8_lossy(&head).lines().next().unwrap_or("").to_string();
+    if status.contains(" 200 ") { Ok(stream) } else { Err(status) }
+}
+
+fn ping(target: &str) -> Result<String, String> {
+    let mut stream = connect_via_proxy(target)?;
+    stream.write_all(b"ping\n").map_err(|e| e.to_string())?;
+    let mut answer = [0u8; 5];
+    stream.read_exact(&mut answer).map_err(|e| e.to_string())?;
+    Ok(String::from_utf8_lossy(&answer).trim().to_string())
+}
+
+fn direct(target: &str) -> Result<String, String> {
+    let address = target.parse().map_err(|_| "bad address".to_string())?;
+    TcpStream::connect_timeout(&address, Duration::from_secs(3)).map(|_| "connected".to_string()).map_err(|e| e.to_string())
+}
+
+fn main() {
+    for arg in std::env::args().skip(1) {
+        let Some((mode, target)) = arg.split_once(':') else { continue };
+        let result = match mode {
+            "ping" => ping(target),
+            "via" => connect_via_proxy(target).map(|_| "tunnel open".to_string()),
+            "direct" => direct(target),
+            _ => Err("unknown mode".to_string()),
+        };
+        match result {
+            Ok(value) => println!("{arg} => OK {value}"),
+            Err(error) => println!("{arg} => ERR {error}"),
+        }
+    }
+}
+"""
+
+
+class Network(unittest.TestCase):
+    """`--net`: the box reaches only the hosts on the project's list, through rbox's proxy."""
+
+    @classmethod
+    def setUpClass(cls):
+        import socket
+        import threading
+        try:
+            rbox.Dirs({}).toolchain()
+        except rbox.Stop as stop:
+            raise unittest.SkipTest(stop.message)
+        cls.tmp = tempfile.mkdtemp(prefix="rbox-net-test-")
+        cls.base = Path(cls.tmp).resolve()
+        cls.env = dict(os.environ, RBOX_TEST_BASE=str(cls.base / "world"))
+        cls.dirs = rbox.Dirs({"RBOX_TEST_BASE": str(cls.base / "world")})
+        done = subprocess.run([RBOX, "new", "netprobe"], cwd=str(cls.base), env=cls.env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        cls.proj = cls.base / "netprobe"
+        (cls.proj / "src" / "main.rs").write_text(NETPROBE_RS)
+        done = subprocess.run([RBOX, "cargo", "build", "-q"], cwd=str(cls.proj), env=cls.env, capture_output=True, text=True)
+        assert done.returncode == 0, done.stdout + done.stderr
+        # a service on this machine: answers "pong" to "ping"
+        cls.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        cls.server.bind(("127.0.0.1", 0))
+        cls.server.listen(16)
+        cls.port = cls.server.getsockname()[1]
+        spare = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        spare.bind(("127.0.0.1", 0))
+        spare.listen(4)
+        cls.spare, cls.other_port = spare, spare.getsockname()[1]
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = cls.server.accept()
+                except OSError:
+                    return
+                try:
+                    if conn.recv(16).startswith(b"ping"):
+                        conn.sendall(b"pong\n")
+                finally:
+                    conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        cls.state = rbox.Project(cls.dirs, cls.proj).state
+        cls.state.mkdir(parents=True, exist_ok=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        if getattr(cls, "tmp", None):
+            cls.server.close()
+            cls.spare.close()
+            shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def allow(self, *targets: str) -> None:
+        (self.state / "net-allow").write_text("".join(f"{t} 2026-11-23\n" for t in targets))
+
+    def run_rbox(self, args: list, cwd: Path | None = None) -> tuple:
+        done = subprocess.run([RBOX, *args], cwd=str(cwd or self.proj), env=self.env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=180)
+        return done.returncode, done.stdout
+
+    def test_1_nothing_listed_means_no_network_mode(self):
+        (self.state / "net-allow").unlink(missing_ok=True)
+        code, out = self.run_rbox(["run", "--net", "--", "netprobe", f"ping:127.0.0.1:{self.port}"])
+        self.assertEqual(code, rbox.EXIT_REFUSED, out)
+        self.assertIn("rbox net allow", out)
+
+    def test_2_adding_a_host_needs_a_person(self):
+        code, out = self.run_rbox(["net", "allow", "api.example.com:443"])
+        self.assertEqual(code, rbox.EXIT_REFUSED, out)
+        self.assertFalse((self.state / "net-allow").exists())
+        code, out = self.run_rbox(["net", "list"])
+        self.assertEqual(code, 0, out)
+
+    def test_3_without_net_there_is_no_network_and_no_proxy(self):
+        self.allow(f"127.0.0.1:{self.port}")
+        code, out = self.run_rbox(["run", "--", "netprobe", f"ping:127.0.0.1:{self.port}", f"direct:127.0.0.1:{self.port}"])
+        self.assertIn(f"ping:127.0.0.1:{self.port} => ERR", out)
+        self.assertIn(f"direct:127.0.0.1:{self.port} => ERR", out)
+
+    def test_4_only_listed_hosts_are_reachable(self):
+        mine, other = f"127.0.0.1:{self.port}", f"127.0.0.1:{self.other_port}"
+        self.allow(mine, f"localhost:{self.port}")
+        (self.state / "net.log").unlink(missing_ok=True)
+        code, out = self.run_rbox(["run", "--net", "--", "netprobe", f"ping:{mine}", f"via:{other}", "via:example.com:443",
+                                   f"direct:{mine}", "direct:1.1.1.1:443", f"via:localhost:{self.port}"])
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"ping:{mine} => OK pong", out)                      # the listed address works, end to end
+        self.assertIn(f"via:{other} => ERR HTTP/1.1 403", out)             # an unlisted address on this machine
+        self.assertIn("via:example.com:443 => ERR HTTP/1.1 403", out)       # an unlisted host
+        self.assertIn(f"direct:{mine} => ERR", out)                        # skipping the proxy gets nowhere
+        self.assertIn("direct:1.1.1.1:443 => ERR", out)
+        self.assertIn(f"via:localhost:{self.port} => ERR HTTP/1.1 403", out)  # a listed name that resolves to a local address
+        log = (self.state / "net.log").read_text()
+        self.assertRegex(log, rf"OK {mine} sent=5 received=5")
+        self.assertRegex(log, rf"REFUSED {other} .*not on this project's list")
+        self.assertRegex(log, r"REFUSED example\.com:443")
+        self.assertRegex(log, rf"REFUSED localhost:{self.port} .*not a public address")
+
+    def test_5_a_real_host_through_the_proxy(self):
+        if "error" in rbox.fetch_index("cfg-if"):
+            self.skipTest("crates.io is not reachable")
+        self.allow("index.crates.io:443")
+        code, out = self.run_rbox(["run", "--net", "--", "netprobe", "via:index.crates.io:443", "via:static.crates.io:443"])
+        self.assertIn("via:index.crates.io:443 => OK tunnel open", out)
+        self.assertIn("via:static.crates.io:443 => ERR HTTP/1.1 403", out)
+
+    def test_6_cargo_run_and_test_can_use_it_builds_cannot(self):
+        mine = f"127.0.0.1:{self.port}"
+        self.allow(mine)
+        code, out = self.run_rbox(["--net", "cargo", "run", "-q", "--", f"ping:{mine}"])
+        self.assertIn(f"ping:{mine} => OK pong", out)
+        code, out = self.run_rbox(["--net", "cargo", "build"])
+        self.assertEqual(code, rbox.EXIT_REFUSED, out)
+
+    def test_7_nothing_is_left_behind(self):
+        import glob
+        self.allow(f"127.0.0.1:{self.port}")
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "rbox-net-*")))
+        self.run_rbox(["run", "--net", "--", "netprobe", f"ping:127.0.0.1:{self.port}"])
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "rbox-net-*")))
+        self.assertEqual(after - before, set())
+
+    def test_8_proxy_rules(self):
+        self.assertEqual(rbox.parse_host_port("API.Example.com:443"), ("api.example.com", 443))
+        self.assertEqual(rbox.parse_host_port("[::1]:8080"), ("::1", 8080))
+        self.assertEqual(rbox.host_key("::1", 8080), "[::1]:8080")
+        for bad in ("example.com", "example.com:0", "example.com:99999", ":443", "a b:443", "user@host:443", "host/path:443"):
+            with self.assertRaises(ValueError, msg=bad):
+                rbox.parse_host_port(bad)
+        self.assertEqual(rbox.resolve_for_proxy("127.0.0.1", 80), ["127.0.0.1"])  # listed literally: used as is
+        with self.assertRaises(PermissionError):
+            rbox.resolve_for_proxy("localhost", 80)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1163,9 +1163,339 @@ def _empty_dir(dirs: Dirs) -> Path:
     return path
 
 
+# ----------------------------------------------------------------- network
+#
+# `--net` does not give the box a network. The box keeps its own empty network
+# namespace; rbox runs a small proxy outside it and passes in one socket. A
+# relay inside the box offers that socket as an ordinary HTTPS proxy on
+# 127.0.0.1. The proxy accepts only CONNECT to a host:port on this project's
+# list, resolves the name itself, and refuses a name that resolves to a local
+# or private address (unless that address was listed on purpose).
+
+PROXY_PORT = 3128
+GENERAL_PURPOSE = ("github.com", "githubusercontent.com", "gitlab.com", "pastebin.com", "amazonaws.com",
+                   "googleapis.com", "blob.core.windows.net", "discord.com", "telegram.org", "dropbox.com")
+
+RELAY_SOURCE = r"""
+import signal, socket, subprocess, sys, threading
+
+port = int(sys.argv[1])
+command = sys.argv[3:]
+
+def pump(source, sink):
+    try:
+        while True:
+            data = source.recv(65536)
+            if not data:
+                break
+            sink.sendall(data)
+    except OSError:
+        pass
+    try:
+        sink.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+def handle(conn):
+    upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        upstream.connect("/rbox/proxy.sock")
+    except OSError:
+        conn.close()
+        return
+    back = threading.Thread(target=pump, args=(upstream, conn), daemon=True)
+    back.start()
+    pump(conn, upstream)
+    back.join()
+    conn.close()
+    upstream.close()
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(64)
+
+def accept():
+    while True:
+        try:
+            conn, _ = server.accept()
+        except OSError:
+            return
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+threading.Thread(target=accept, daemon=True).start()
+child = subprocess.Popen(command)
+for sig in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(sig, lambda number, frame: child.send_signal(number))
+code = child.wait()
+sys.exit(128 - code if code < 0 else code)
+"""
+
+
+def parse_host_port(text: str) -> tuple:
+    """('host', port) from 'host:port' or '[v6]:port'. Raises ValueError."""
+    host, sep, port_text = text.strip().rpartition(":")
+    if not sep or not host or not port_text.isdigit():
+        raise ValueError("expected HOST:PORT")
+    port = int(port_text)
+    if not 0 < port < 65536:
+        raise ValueError("port out of range")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    host = host.lower()
+    if not host or any(c.isspace() or c in "/@\\\"'" for c in host):
+        raise ValueError("not a host name")
+    return host, port
+
+
+def host_key(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def load_net_allow(project: Project) -> set:
+    return {a for a, _ in load_pairs(project.state / "net-allow")}
+
+
+def is_ip(text: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(text)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_for_proxy(host: str, port: int) -> list:
+    """Addresses the proxy may connect to for an allowed host. A name must resolve
+    only to public addresses; an address that was listed literally is used as is."""
+    import ipaddress
+    import socket
+    if is_ip(host):
+        return [host]
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    addresses = []
+    for info in infos:
+        address = info[4][0].split("%")[0]
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise OSError("no address")
+    for address in addresses:
+        if not ipaddress.ip_address(address).is_global:
+            raise PermissionError(f"{host} resolves to {address}, which is not a public address")
+    return addresses
+
+
+class Proxy:
+    """Listens on a unix socket; one thread per connection."""
+
+    def __init__(self, path: str, allow: set, log_path: Path) -> None:
+        import socket
+        import threading
+        self.allow = allow
+        self.log_path = log_path
+        self.lock = threading.Lock()
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(path)
+        os.chmod(path, 0o600)
+        self.server.listen(64)
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def close(self) -> None:
+        try:
+            self.server.close()
+        except OSError:
+            pass
+
+    def log(self, target: str, verdict: str, sent: int = 0, received: int = 0, note: str = "") -> None:
+        line = f"{datetime.datetime.now().astimezone().isoformat(timespec='seconds')} {verdict} {target} sent={sent} received={received} {note}".rstrip() + "\n"
+        with self.lock:
+            try:
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(line)
+            except OSError:
+                pass
+
+    def accept(self) -> None:
+        import threading
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+
+    @staticmethod
+    def reply(conn, status: str, body: str) -> None:
+        try:
+            conn.sendall((f"HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nConnection: close\r\n"
+                          f"Content-Length: {len(body.encode())}\r\n\r\n{body}").encode())
+        except OSError:
+            pass
+        conn.close()
+
+    def handle(self, conn) -> None:
+        import socket
+        import threading
+        try:
+            conn.settimeout(20)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                if len(data) > 8192:
+                    return self.reply(conn, "431 Request Header Fields Too Large", "rbox proxy: request too large\n")
+                chunk = conn.recv(4096)
+                if not chunk:
+                    conn.close()
+                    return
+                data += chunk
+            head, _, rest = data.partition(b"\r\n\r\n")
+            words = head.split(b"\r\n", 1)[0].decode("latin-1").split()
+            if len(words) != 3 or words[0].upper() != "CONNECT":
+                self.log(words[1] if len(words) > 1 else "?", "REFUSED", note="not a CONNECT request")
+                return self.reply(conn, "405 Method Not Allowed",
+                                  "rbox proxy: only CONNECT (an HTTPS or raw TCP tunnel) is supported\n")
+            try:
+                host, port = parse_host_port(words[1])
+            except ValueError:
+                return self.reply(conn, "400 Bad Request", "rbox proxy: bad CONNECT target\n")
+            target = host_key(host, port)
+            if target not in self.allow:
+                self.log(target, "REFUSED", note="not on this project's list")
+                return self.reply(conn, "403 Forbidden",
+                                  f"rbox proxy: {target} is not on this project's network list. "
+                                  f"The user adds it with: rbox net allow {target}\n")
+            try:
+                addresses = resolve_for_proxy(host, port)
+            except PermissionError as exc:
+                self.log(target, "REFUSED", note=str(exc))
+                return self.reply(conn, "403 Forbidden", f"rbox proxy: {exc}\n")
+            except OSError as exc:
+                self.log(target, "FAILED", note=f"cannot resolve: {exc}")
+                return self.reply(conn, "502 Bad Gateway", f"rbox proxy: cannot resolve {host}: {exc}\n")
+            upstream = None
+            error = "no address"
+            for address in addresses:
+                try:
+                    upstream = socket.create_connection((address, port), timeout=10)
+                    break
+                except OSError as exc:
+                    error = str(exc)
+            if upstream is None:
+                self.log(target, "FAILED", note=f"cannot connect: {error}")
+                return self.reply(conn, "502 Bad Gateway", f"rbox proxy: cannot connect to {target}: {error}\n")
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            conn.settimeout(None)
+            upstream.settimeout(None)
+            counts = {"sent": len(rest), "received": 0}
+            if rest:
+                upstream.sendall(rest)
+
+            def pump(source, sink, key: str) -> None:
+                try:
+                    while True:
+                        chunk = source.recv(65536)
+                        if not chunk:
+                            break
+                        sink.sendall(chunk)
+                        counts[key] += len(chunk)
+                except OSError:
+                    pass
+                try:
+                    sink.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+
+            back = threading.Thread(target=pump, args=(upstream, conn, "received"), daemon=True)
+            back.start()
+            pump(conn, upstream, "sent")
+            back.join()
+            self.log(target, "OK", counts["sent"], counts["received"])
+            upstream.close()
+            conn.close()
+        except OSError:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+
 def run_with_network(dirs: Dirs, bwrap: str, toolchain: Path, project: Project, cwd: Path,
-                     command: list, extra_env: dict, binds: list | None = None) -> int:
-    raise refuse("allow-listed network (`--net`) is not built yet in this version of rbox")
+                     command: list, extra_env: dict, binds: list | None = None, quiet: bool = False) -> int:
+    allow = load_net_allow(project)
+    if not allow:
+        raise refuse(
+            "this project has no hosts on its network list, so `--net` has nothing to reach",
+            "the user adds one in their own terminal: rbox net allow HOST:PORT",
+        )
+    project.prepare()
+    runtime = tempfile.mkdtemp(prefix="rbox-net-")
+    proxy = None
+    try:
+        proxy = Proxy(os.path.join(runtime, "proxy.sock"), allow, project.state / "net.log")
+        box = build_box(dirs, bwrap, toolchain, project, cwd, extra_env)
+        for path in binds or []:
+            box.add("--bind", str(path), str(path))
+        box.add("--ro-bind", os.path.join(runtime, "proxy.sock"), "/rbox/proxy.sock")
+        box.add("--ro-bind-try", "/etc/ssl/certs", "/etc/ssl/certs")
+        box.data("/rbox/relay.py", RELAY_SOURCE)
+        address = f"http://127.0.0.1:{PROXY_PORT}"
+        box.env.update({
+            "HTTPS_PROXY": address, "https_proxy": address, "ALL_PROXY": address, "all_proxy": address,
+            "RBOX_PROXY": f"127.0.0.1:{PROXY_PORT}",
+        })
+        if os.path.isfile("/etc/ssl/certs/ca-certificates.crt"):
+            box.env["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt"
+        if not quiet:
+            say("rbox: network on, through the proxy, to: " + ", ".join(sorted(allow)))
+        return box.run(["/usr/bin/python3", "-I", "/rbox/relay.py", str(PROXY_PORT), "--", *command],
+                       capture=quiet).returncode
+    finally:
+        if proxy is not None:
+            proxy.close()
+        shutil.rmtree(runtime, ignore_errors=True)
+
+
+def cmd_net(dirs: Dirs, args: list) -> int:
+    usage = "usage: rbox net list | rbox net allow HOST:PORT | rbox net remove HOST:PORT"
+    if not args or args[0] not in ("list", "allow", "remove"):
+        raise refuse(usage)
+    action = args[0]
+    if action == "allow":
+        require_human("net allow")
+    bwrap, toolchain, project = open_project(dirs)
+    path = project.state / "net-allow"
+    if action == "list":
+        entries = sorted(load_pairs(path))
+        if not entries:
+            say("rbox: no hosts are listed for this project; `--net` cannot reach anything")
+        for target, date in entries:
+            sys.stdout.write(f"{target}   (added {date})\n")
+        return 0
+    if len(args) != 2:
+        raise refuse(usage)
+    try:
+        host, port = parse_host_port(args[1])
+    except ValueError as exc:
+        raise refuse(f"{args[1]}: {exc}")
+    target = host_key(host, port)
+    if action == "remove":
+        kept = [line for line in (path.read_text(encoding="utf-8").splitlines() if path.is_file() else [])
+                if line.split()[:1] != [target]]
+        write_atomic(path, "\n".join(kept) + ("\n" if kept else ""))
+        say(f"rbox: {target} removed from this project's network list")
+        return 0
+    if any(host == name or host.endswith("." + name) for name in GENERAL_PURPOSE):
+        say(f"rbox: caution: {host} can store or forward data for anyone. A bad crate could use it to send data out.")
+        if ask(f"Type the host name again to list it anyway, or Enter to cancel: ") != host:
+            say("rbox: cancelled")
+            return EXIT_REFUSED
+    project.prepare()
+    today = datetime.date.today().isoformat()
+    existing = path.read_text(encoding="utf-8") if path.is_file() else "# Hosts this project may reach with --net. host:port date\n"
+    if target not in load_net_allow(project):
+        write_atomic(path, existing + f"{target} {today}\n")
+    say(f"rbox: {target} is now reachable with --net from {project.root.name}")
+    return 0
 
 
 # ------------------------------------------------------------------- allow
@@ -1566,7 +1896,12 @@ def named_env(name: str) -> dict:
 
 # ---------------------------------------------------------------- selftest
 
-SELFTEST_STAGES = ("build-script", "proc-macro", "test", "run")
+SELFTEST_STAGES = ("build-script", "proc-macro", "test", "run", "run-net")
+SELFTEST_NET_PROBES = [  # only in the `run-net` stage
+    "control: the listed host is reachable through the proxy",
+    "reach an unlisted host through the proxy",
+    "reach an unlisted service on this machine through the proxy",
+]
 SELFTEST_PROBES = [
     "read a file in your home folder",
     "see your home folder",
@@ -1648,10 +1983,13 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
     root = Path(tempfile.mkdtemp(prefix="rbox-selftest-")).resolve()
     canary_file = dirs.home / ".cache" / f"rbox-selftest-canary-{nonce}"
     project = Project(dirs, root)
-    hits = {"tcp": 0, "abstract": 0}
+    hits = {"tcp": 0, "abstract": 0, "unlisted": 0}
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp.bind(("127.0.0.1", 0))
     tcp.listen(8)
+    unlisted = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # a second service that is never put on the list
+    unlisted.bind(("127.0.0.1", 0))
+    unlisted.listen(8)
     abstract_name = f"rbox-selftest-{nonce}"
     unix = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     unix.bind("\0" + abstract_name)
@@ -1666,7 +2004,7 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             hits[key] += 1
             conn.close()
 
-    for listener, key in ((tcp, "tcp"), (unix, "abstract")):
+    for listener, key in ((tcp, "tcp"), (unix, "abstract"), (unlisted, "unlisted")):
         threading.Thread(target=accept, args=(listener, key), daemon=True).start()
     sockets = host_sockets(dirs)
     has_tty = True
@@ -1692,6 +2030,7 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             f"pub const HOME: &str = {rust_str(str(dirs.home))};",
             f"pub const ROOT: &str = {rust_str(str(root))};",
             f'pub const HOST_TCP: &str = "127.0.0.1:{tcp.getsockname()[1]}";',
+            f'pub const HOST_TCP_UNLISTED: &str = "127.0.0.1:{unlisted.getsockname()[1]}";',
             f"pub const ABSTRACT: &str = {rust_str(abstract_name)};",
             'pub const RESULTS: &str = "/rbox/target/selftest";',
             "pub const SOCKETS: &[&str] = &[" + ", ".join(rust_str(p) for p in sockets) + "];",
@@ -1716,6 +2055,13 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             box = build_box(dirs, bwrap, toolchain, project, root)
             done = box.run([CARGO, step[0], "--locked", *SOURCE_PINS, "--quiet"], capture=True)
             logs.append((step[0], done.returncode, done.stderr[-1500:]))
+        time.sleep(0.1)
+        plain_hits = dict(hits)  # nothing may have reached the host listeners so far
+        # the same program once more, now with `--net` and exactly one host listed: our own listener
+        project.prepare()
+        write_atomic(project.state / "net-allow", f"127.0.0.1:{tcp.getsockname()[1]} selftest\n")
+        code = run_with_network(dirs, bwrap, toolchain, project, root, ["/rbox/target/debug/hostile", "run-net"], {}, quiet=True)
+        logs.append(("run --net", code, ""))
         time.sleep(0.1)
 
         results: dict = {}
@@ -1743,7 +2089,11 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             }
             return checks.get(name, False)
 
-        expected = SELFTEST_PROBES + [f"connect to socket {p}" for p in sockets]
+        expected = SELFTEST_PROBES + [f"connect to socket {p}" for p in sockets] + SELFTEST_NET_PROBES
+        if hits["tcp"] != plain_hits["tcp"] + 1:
+            broken_net = f"the proxy passed {hits['tcp'] - plain_hits['tcp']} connections to the listed host (expected exactly 1)"
+        else:
+            broken_net = ""
         leaked, broken, lines = [], [], []
         for name in expected:
             verdicts = []
@@ -1751,9 +2101,13 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
                 status, detail = results[stage].get(name, ("MISSING", "the probe did not run"))
                 if status == "INBOX":
                     status = "LEAKED" if host_changed(name, stage) else "BLOCKED"
-                if name == "connect to a service on this machine (TCP)" and hits["tcp"] > baseline["tcp"]:
+                if name == "connect to a service on this machine (TCP)" and plain_hits["tcp"] > baseline["tcp"]:
                     status = "LEAKED"
                 if name == "connect to an abstract socket on this machine" and hits["abstract"] > 0:
+                    status = "LEAKED"
+                if stage != "run-net" and name in SELFTEST_NET_PROBES:
+                    continue
+                if name == "reach an unlisted service on this machine through the proxy" and hits["unlisted"] > 0:
                     status = "LEAKED"
                 verdicts.append((stage, status, detail))
             statuses = {status for _, status, _ in verdicts}
@@ -1769,8 +2123,11 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
                     if status not in ("OK" if control else "BLOCKED",):
                         lines.append(f"           {stage}: {status} {detail}")
                         (leaked if status == "LEAKED" else broken).append(f"{name} [{stage}]")
+        if broken_net:
+            lines.append(f"  FAILED   {broken_net}")
+            broken.append("proxy connection count")
         sys.stdout.write("\n".join(lines) + "\n")
-        total = len(expected) * len(SELFTEST_STAGES)
+        total = (len(expected) - len(SELFTEST_NET_PROBES)) * len(SELFTEST_STAGES) + len(SELFTEST_NET_PROBES)
         if leaked or broken:
             for step, code, tail in logs:
                 if code != 0:
@@ -1778,14 +2135,15 @@ def cmd_selftest(dirs: Dirs, args: list) -> int:
             sys.stdout.write(f"\nrbox selftest: FAILED. leaked: {len(leaked)}, did not run or broken: {len(broken)} (of {total} checks)\n")
             return 1
         sys.stdout.write(
-            f"\nrbox selftest: passed. {len(expected)} probes x {len(SELFTEST_STAGES)} stages "
-            f"(build script, proc macro, test, program) = {total} checks, nothing leaked.\n"
+            f"\nrbox selftest: passed. {total} checks across {len(SELFTEST_STAGES)} stages "
+            f"(build script, proc macro, test, program, program with --net), nothing leaked.\n"
         )
         return 0
     finally:
         os.environ.pop("RBOX_SELFTEST_CANARY", None)
         tcp.close()
         unix.close()
+        unlisted.close()
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(project.cache, ignore_errors=True)
         shutil.rmtree(project.state, ignore_errors=True)
@@ -1923,6 +2281,8 @@ USAGE = """rbox: build, test and run Rust inside a box.
   rbox status               where things are and what is waiting
   rbox warm                 pre-build after dependency changes
   rbox run -- PROGRAM       run a built program in the box
+  rbox --net cargo test     tests / run / bench with network, only to the listed hosts
+  rbox net list             the hosts this project may reach (`rbox net allow HOST:PORT`: a person)
   rbox export PROGRAM --to FOLDER   copy a built program out of the box (a person)
   rbox new NAME [--lib]     create a project with the safety settings
   rbox clean                empty this project's build output
@@ -1974,7 +2334,7 @@ def main(argv: list) -> int:
     simple = {
         "sync": cmd_sync, "allow": cmd_allow, "pending": cmd_pending, "urgent": cmd_urgent, "status": cmd_status, "warm": cmd_warm,
         "export": cmd_export, "clean": cmd_clean, "new": cmd_new, "shell": cmd_shell, "doctor": cmd_doctor,
-        "toolchain": cmd_toolchain, "selftest": cmd_selftest,
+        "toolchain": cmd_toolchain, "selftest": cmd_selftest, "net": cmd_net,
     }
     if command in simple:
         return simple[command](dirs, rest)
