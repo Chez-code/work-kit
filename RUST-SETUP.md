@@ -144,13 +144,17 @@ Things that differ from plain cargo:
 - **The project is read-only while building.** A build script or test that
   writes into the source tree fails. Write under the build output
   (`OUT_DIR`, `CARGO_TARGET_TMPDIR`) or `/tmp` instead.
-- **`.git`, `.claude`, `.mcp.json`, `.env` and `.env.*` are hidden in the box**,
-  wherever they are in the project. Keep keys out of the project tree anyway
-  and pass them at run time: `rbox run --env API_KEY -- NAME`.
+- **`.git`, `.claude`, `.mcp.json`, `.env`, `.env.*`, `.envrc`, `.netrc`, `.npmrc`
+  and `.pypirc` are hidden in the box**, wherever they are in the project.
+  Keep keys out of the project tree anyway and pass them at run time:
+  `rbox run --env API_KEY -- NAME`.
 - **To read a dependency's source**, look under the "crate sources" path that
   `rbox status` prints.
 - **A built program leaves the box only through `rbox export NAME --to FOLDER`**,
   which is a **PERSON** step and prints the file's sha256.
+- **A boxed command stops when the shell that started it exits.** That is
+  what keeps a killed session from leaving builds behind. Run a long job in
+  tmux, or as a service.
 
 ## Adding or updating a crate
 

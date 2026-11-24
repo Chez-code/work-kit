@@ -82,7 +82,7 @@ REFUSED_FLAGS = ("--config", "-Z", "--target-dir", "-C")
 PASS_ENV = ("RUST_BACKTRACE", "RUST_LOG", "RUSTFLAGS", "RUSTDOCFLAGS", "NO_COLOR", "CARGO_TERM_COLOR")
 PROXY_ENV = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "all_proxy", "no_proxy")
 HIDE_DIRS = (".git", ".claude")
-HIDE_FILES = (".mcp.json", ".env")
+HIDE_FILES = (".mcp.json", ".env", ".envrc", ".netrc", ".npmrc", ".pypirc")
 WALK_PRUNE = {"target", "vendor", "node_modules", ".venv", "__pycache__"}
 WALK_LIMIT = 200000
 
@@ -416,7 +416,7 @@ def check_root(dirs: Dirs, root: Path) -> None:
 
 def hidden_paths(root: Path) -> tuple:
     """(dirs, files) to hide in every box: .git, .claude, .mcp.json, .env, .env.*
-    wherever they appear in the project tree."""
+    and a few other files that commonly hold tokens, wherever they appear in the project tree."""
     hide_dirs: list = []
     hide_files: list = []
     seen = 0
@@ -1295,6 +1295,7 @@ class Proxy:
         self.allow = allow
         self.log_path = log_path
         self.lock = threading.Lock()
+        self.slots = threading.BoundedSemaphore(128)  # a program in the box cannot exhaust our threads
         self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.server.bind(path)
         os.chmod(path, 0o600)
@@ -1323,7 +1324,16 @@ class Proxy:
                 conn, _ = self.server.accept()
             except OSError:
                 return
-            threading.Thread(target=self.handle, args=(conn,), daemon=True).start()
+            if not self.slots.acquire(blocking=False):
+                conn.close()
+                continue
+            threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
+
+    def serve(self, conn) -> None:
+        try:
+            self.handle(conn)
+        finally:
+            self.slots.release()
 
     @staticmethod
     def reply(conn, status: str, body: str) -> None:
@@ -2278,7 +2288,9 @@ def cmd_doctor(dirs: Dirs, args: list) -> int:
         failed = failed or ok is False
         sys.stdout.write(f"  {mark}  {label:18} {detail}\n")
     if apt:
-        sys.stdout.write("\nA person with sudo runs this once:\n  sudo apt install " + " ".join(sorted(set(" ".join(apt).split()))) + "\n")
+        packages = " ".join(sorted(set(" ".join(apt).split())))
+        sys.stdout.write(f"\nA person with sudo installs these once: {packages}\n"
+                         f"  on Debian or Ubuntu:  sudo apt install {packages}\n")
     sys.stdout.write("\n" + ("rbox: this machine is NOT ready\n" if failed else "rbox: this machine is ready\n"))
     return EXIT_CANNOT_RUN if failed else 0
 
