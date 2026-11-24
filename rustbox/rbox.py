@@ -27,12 +27,14 @@ if sys.version_info < (3, 9):
     sys.exit(4)
 
 import concurrent.futures
+import ctypes
 import datetime
 import hashlib
 import json
 import os
 import pwd
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -1130,6 +1132,7 @@ def cmd_cargo(dirs: Dirs, args: list, net: bool, extra_env: dict) -> int:
     if cwd != project.root and project.root not in cwd.parents:
         cwd = project.root
     if sub in SYNC_CMDS:
+        say(f"rbox: `cargo {sub}` here means `rbox sync`: download what the lockfile names into rbox's copy")
         return do_sync(dirs, bwrap, toolchain, project)
     if sub in FETCH_LOCAL_CMDS:
         return run_fetch(dirs, bwrap, toolchain, project, cwd, [CARGO, *leading, sub, *rest], network=False)
@@ -1917,7 +1920,21 @@ USAGE = """rbox: build, test and run Rust inside a box.
 """
 
 
+def die_with_caller() -> None:
+    """Ask the kernel to kill this process when its caller dies. The setting survives
+    the switch to bwrap, so a caller killed while rbox is still starting (before
+    bwrap's own --die-with-parent is in place) cannot leave a boxed program behind."""
+    caller = os.getppid()
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        return
+    if os.getppid() != caller:
+        os._exit(1)  # the caller went away in between
+
+
 def main(argv: list) -> int:
+    die_with_caller()
     dirs = Dirs(dict(os.environ))
     if dirs.test_world:
         say("rbox: note: test world (RBOX_TEST_BASE); approvals here are not this machine's")
