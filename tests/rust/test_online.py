@@ -94,7 +94,7 @@ class Online(unittest.TestCase):
     @classmethod
     def approve_everything(cls, cwd: Path) -> int:
         """Test-world approval: copy what is approvable into this world's confirmed file."""
-        code, out = cls.run_rbox(["allow", "--tsv"], cwd)
+        code, out = cls.run_rbox(["pending", "--tsv"], cwd)
         assert code == 0, out
         lines = [line.split("\t") for line in out.splitlines() if "\t" in line]
         rbox.add_confirmed(cls.dirs, [(f[0], f[1], f[2]) for f in lines if f[5] == "approvable"])
@@ -115,7 +115,7 @@ class Online(unittest.TestCase):
         self.assertIn("serde_json", out)
 
     def test_02_review_table_has_what_a_person_needs(self):
-        code, out = self.run_rbox(["allow", "--show"], self.proj)
+        code, out = self.run_rbox(["pending"], self.proj)
         self.assertEqual(code, 0, out)
         self.assertIn("RUNS CODE AT BUILD TIME", out)
         self.assertRegex(out, r"serde_derive\s+\S+ \(new\)\s+published .* ago\s+proc macro\s+via serde")
@@ -177,7 +177,7 @@ class Online(unittest.TestCase):
         code, out = self.run_rbox(["cargo", "build"], self.proj)
         self.assertEqual(code, rbox.EXIT_WAITING, out)
         self.assertIn(f"itoa {older}", out)
-        code, out = self.run_rbox(["allow", "--show"], self.proj)
+        code, out = self.run_rbox(["pending"], self.proj)
         self.assertIn(f"{current['version']} -> {older}", out)
         self.approve_everything(self.proj)
         code, out = self.run_rbox(["cargo", "build"], self.proj)
@@ -223,7 +223,7 @@ class Online(unittest.TestCase):
             code, out = self.run_rbox(["cargo", "build"], self.proj)
             self.assertEqual(code, rbox.EXIT_WAITING, out)
             self.assertIn("itoa (local: third_party/itoa)", out)
-            code, out = self.run_rbox(["allow", "--show"], self.proj)
+            code, out = self.run_rbox(["pending"], self.proj)
             self.assertIn("LOCAL CODE STANDING IN FOR A CRATE (1)", out)
             self.assertIn("replaces a crates.io crate", out)
             rbox.add_pairs(self.state_of(self.proj) / "local-ok", [("itoa", "third_party/itoa")], "# test\n")

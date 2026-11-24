@@ -26,6 +26,7 @@ sys.path.insert(0, str(HOOKS))
 import bash_guard  # noqa: E402
 import gate  # noqa: E402
 import gate_log  # noqa: E402
+import policy_guard  # noqa: E402
 
 # Real captures, 2026-09-07: ruff 0.16.x `check --output-format concise`, pytest `-q -x` (uv-managed venv).
 PYTEST_SAMPLE = """\
@@ -298,6 +299,74 @@ class Lanes(unittest.TestCase):
         guard = bash_guard.Guard(root)
         found = guard.find("sed -i s/a/b/ src/main.rs && echo x >> Cargo.lock")
         self.assertEqual([label for label, _ in found], ["in-place edit", "redirect into source"])
+
+
+class PolicyGuard(unittest.TestCase):
+    REFUSED = [
+        "rbox allow",
+        "cd svc && rbox allow",
+        "/home/u/.local/bin/rbox allow",
+        "rbox urgent serde@1.0.230",
+        "rbox export recorder --release --to /tmp/out",
+        "rbox net allow api.example.com:443",
+        "FOO=1 rbox allow",
+        "timeout 5 rbox allow",
+        "env -i rbox allow",
+        "env -u CLAUDECODE rbox allow",
+        "nohup rbox allow &",
+        "sh -c 'rbox allow'",
+        'bash -lc "cd x && rbox allow"',
+        "script -qec 'rbox allow' /dev/null",
+        "unbuffer rbox allow",
+        "expect -c 'spawn rbox allow'",
+        "tmux send-keys -t 1 'rbox allow' Enter",
+        "tmux paste-buffer -t 1",
+        "screen -S main -X stuff 'yes\\n'",
+        "xdotool type yes",
+        "cat ~/.local/state/rustbox/confirmed",
+        "echo 'serde 1.0.229 abc 2026-11-23' >> /home/u/.local/state/rustbox/confirmed",
+        "~/.local/share/rustbox/toolchains/1.100.0/bin/cargo build",
+        "~/.cache/rustbox/30f4387b4995d73b/target/debug/app --live",
+        "cp ~/.cache/rustbox/30f4387b4995d73b/target/release/app /tmp/",
+        "RBOX_TEST_BASE=/tmp/w rbox cargo build",
+        "find . -name x -exec rbox allow ;",
+    ]
+    ALLOWED = [
+        "rbox pending",
+        "rbox sync",
+        "rbox status",
+        "rbox doctor",
+        "rbox run -- recorder",
+        "rbox --net cargo test -- --ignored",
+        "rbox net list",
+        "cargo build --release",
+        "cargo add serde",
+        "ls ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src",
+        "cat ~/.cache/rustbox/30f4387b4995d73b/vendor/serde-1.0.229/src/lib.rs",
+        "unbuffer cargo test",
+        "script build.log",
+        "git commit -m 'document rbox allow'",
+        'grep -rn "rbox allow" README.md',
+        "tmux list-panes",
+        "screen -ls",
+        "echo done",
+    ]
+
+    def test_refused(self):
+        for command in self.REFUSED:
+            self.assertIsNotNone(policy_guard.check_command(command), command)
+
+    def test_allowed(self):
+        for command in self.ALLOWED:
+            self.assertIsNone(policy_guard.check_command(command), command)
+
+    def test_edits_inside_rbox_folders_are_refused(self):
+        home = Path("/home/u")
+        for path in ("/home/u/.local/state/rustbox/confirmed", "/home/u/.cache/rustbox/abc/vendor/x/src/lib.rs",
+                     "/home/u/.local/share/rustbox/bin/rbox"):
+            self.assertIsNotNone(policy_guard.check_path(path, home), path)
+        for path in ("/home/u/projects/app/src/main.rs", "/home/u/projects/app/Cargo.toml", ""):
+            self.assertIsNone(policy_guard.check_path(path, home), path)
 
 
 class State(unittest.TestCase):

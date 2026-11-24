@@ -36,9 +36,26 @@ sync_file() { # sync_file <relpath>
   echo "                 then delete the .prev — it's yours to remove"
 }
 
+# Files a newer kit release added: a repo bootstrapped earlier does not have
+# them, and the synced settings.json and gate.py expect them. Install them
+# (never overwriting) before anything that refers to them is updated.
+add_if_missing() { # add_if_missing <relpath>
+  src="$KIT/$1"; dst="$TARGET/$1"
+  if [ ! -e "$dst" ] && [ -e "$TARGET/.claude/hooks/gate.py" ]; then
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+    echo "added:           $1  (new in this kit release)"
+  fi
+}
+add_if_missing .claude/hooks/gate_log.py
+add_if_missing .claude/hooks/bash_guard.py
+add_if_missing .claude/hooks/policy_guard.py
+add_if_missing .claude/bin/gate-watch.py
+
 sync_file .claude/hooks/gate.py
 sync_file .claude/hooks/gate_log.py
 sync_file .claude/hooks/bash_guard.py
+sync_file .claude/hooks/policy_guard.py
 sync_file .claude/bin/gate-watch.py
 
 # settings.json is kit-managed only if it wires gate.py; a settings.json

@@ -428,5 +428,54 @@ assert_eq "$(grep -c 'cargo check' "$RSHIM/calls.log")" 1 "two .rs targets: one 
 guard_in "$RR" "$(printf '{"cwd":"%s","session_id":"smoke-rust","tool_input":{"command":"sed -i s/a/b/ Cargo.lock"}}' "$RR")"
 assert_has "$OUT" 'gate re-run: green' "a shell edit to Cargo.lock is gated"
 
+# ---------------------------------------------------------- 17. policy guard
+say "17. policy guard: approvals stay with the operator"
+policy_in() { local r="$1" p="$2"; set +e; OUT="$(echo "$p" | CLAUDE_PROJECT_DIR="$r" python3 "$r/.claude/hooks/policy_guard.py" 2>"$WORK/err")"; RC=$?; set -e; ERR="$(cat "$WORK/err")"; RLOG="$r/.claude/gate-log.jsonl"; }
+bashp() { printf '{"cwd":"%s","session_id":"smoke-rust","tool_name":"Bash","tool_input":{"command":"%s"}}' "$1" "$2"; }
+[ -f "$RR/.claude/hooks/policy_guard.py" ] || fail "bootstrap did not install policy_guard.py"; ok "bootstrap installs the guard"
+policy_in "$RR" "$(bashp "$RR" 'rbox allow')"
+assert_eq "$RC" 2 "rbox allow is refused"; assert_has "$ERR" "POLICY GUARD\] Refused" "refusal says so"
+assert_has "$ERR" "Only the user can do this" "Claude is told to ask the user"
+assert_has "$(rlast)" '"kind": "policy"' "refusal is logged"
+policy_in "$RR" "$(bashp "$RR" 'timeout 5 rbox allow')"; assert_eq "$RC" 2 "a wrapped rbox allow is refused"
+policy_in "$RR" "$(bashp "$RR" 'tmux send-keys -t 1 yes Enter')"; assert_eq "$RC" 2 "typing into another pane is refused"
+policy_in "$RR" "$(bashp "$RR" 'cat ~/.local/state/rustbox/confirmed')"; assert_eq "$RC" 2 "rbox state folder is off limits"
+policy_in "$RR" "$(bashp "$RR" 'rbox pending')"; assert_eq "$RC" 0 "rbox pending is allowed"; assert_eq "$OUT$ERR" "" "allowed commands print nothing"
+policy_in "$RR" "$(bashp "$RR" 'cargo build')"; assert_eq "$RC" 0 "cargo build is allowed"
+policy_in "$RR" "$(printf '{"cwd":"%s","tool_name":"Edit","tool_input":{"file_path":"%s/.local/state/rustbox/confirmed"}}' "$RR" "$HOME")"
+assert_eq "$RC" 2 "editing rbox's confirmed set is refused"
+policy_in "$RR" "$(printf '{"cwd":"%s","tool_name":"Edit","tool_input":{"file_path":"%s/src/main.rs"}}' "$RR" "$RR")"
+assert_eq "$RC" 0 "editing project source is allowed"
+policy_in "$REPO" "$(bashp "$REPO" 'rbox allow')"
+assert_eq "$RC" 0 "the guard is inactive in a repo with no Cargo.toml"
+( cd "$RR" && CLAUDE_PROJECT_DIR="$RR" timeout 2 python3 .claude/bin/gate-watch.py --from-start --no-tmux --no-color > "$WORK/pwatch.txt" || true )
+assert_has "$(cat "$WORK/pwatch.txt")" "POLICY .*REFUSED" "watcher shows policy refusals"
+python3 - "$KIT/kit/.claude/settings.json" <<'PY' || fail "settings.json is not what the guard needs"
+import json, sys
+cfg = json.load(open(sys.argv[1]))
+pre = cfg["hooks"]["PreToolUse"][0]
+assert "Bash" in pre["matcher"] and "Edit" in pre["matcher"]
+assert "policy_guard.py" in pre["hooks"][0]["command"] and "|| exit 0" in pre["hooks"][0]["command"]
+deny = cfg["permissions"]["deny"]
+for rule in ("Bash(rbox allow:*)", "Bash(rbox urgent:*)", "Bash(rbox export:*)", "Edit(~/.local/state/rustbox/**)"):
+    assert rule in deny, rule
+PY
+ok "settings.json wires the guard and the deny rules"
+
+# ----------------------------------------- 18. bootstrap and sync know Rust
+say "18. bootstrap and sync on Rust repos"
+[ ! -e "$RR/.pre-commit-config.yaml" ] || fail "Python pre-commit template landed in a Rust repo"; ok "Rust repo: no Python pre-commit template"
+[ ! -e "$RR/.github/workflows/ci.yml" ] || fail "Python CI template landed in a Rust repo"; ok "Rust repo: no Python CI template"
+[ -e "$PYO3/.pre-commit-config.yaml" ] || fail "PyO3 repo lost its Python templates"; ok "PyO3 repo keeps the Python templates"
+[ ! -e "$MIX/.pre-commit-config.yaml" ] || fail "Python template landed in a .NET + Rust repo"; ok ".NET + Rust repo: no Python templates"
+assert_has "$("$KIT/bootstrap.sh" "$RR")" "rbox doctor" "next steps mention rbox for a Rust repo"
+OLD="$WORK/oldrepo"; mkdir -p "$OLD/.claude/hooks"; ( cd "$OLD" && git init -q )
+cp "$KIT/kit/.claude/hooks/gate.py" "$OLD/.claude/hooks/gate.py"; cp "$KIT/kit/.claude/settings.json" "$OLD/.claude/settings.json"
+SYNC="$("$KIT/sync.sh" "$OLD")"
+assert_has "$SYNC" "added:           .claude/hooks/policy_guard.py" "sync adds the guard to a repo bootstrapped before it existed"
+[ -f "$OLD/.claude/hooks/policy_guard.py" ] || fail "sync did not install policy_guard.py"; ok "the file is there after sync"
+echo '{}' | CLAUDE_PROJECT_DIR="$WORK/nowhere" sh -c '[ -f "$CLAUDE_PROJECT_DIR/.claude/hooks/policy_guard.py" ] || exit 0; python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/policy_guard.py"'
+assert_eq "$?" 0 "a repo without the guard file does not block every tool call"
+
 printf '\nALL OK  (%d assertions)  work dir: %s\n' "$PASS" "$WORK"
 cleanup

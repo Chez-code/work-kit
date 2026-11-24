@@ -970,7 +970,7 @@ def require_approved(dirs: Dirs, project: Project) -> None:
         noun = "crate awaits" if len(waiting_for) == 1 else "crates await"
         raise waiting(
             f"{len(waiting_for)} {noun} approval: {shown}",
-            "a person runs `rbox allow` in their own terminal; `rbox allow --show` lists them",
+            "a person runs `rbox allow` in their own terminal; `rbox pending` lists them",
         )
 
 
@@ -1250,14 +1250,24 @@ def show_pending(approvable: list, refused: list, local: list, out) -> None:
     out.flush()
 
 
-def cmd_allow(dirs: Dirs, args: list) -> int:
-    show = "--show" in args
-    tsv = "--tsv" in args
-    unknown = [a for a in args if a not in ("--show", "--tsv")]
+def cmd_pending(dirs: Dirs, args: list) -> int:
+    """List what is waiting, without approving anything. Anyone may run this."""
+    unknown = [a for a in args if a != "--tsv"]
     if unknown:
-        raise refuse(f"`rbox allow` takes no crate names (got {unknown[0]}); it reviews everything pending")
-    if not (show or tsv):
-        require_human("allow")
+        raise refuse(f"`rbox pending` takes no arguments (got {unknown[0]})")
+    return review(dirs, approve=False, tsv="--tsv" in args)
+
+
+def cmd_allow(dirs: Dirs, args: list) -> int:
+    if args:
+        raise refuse(f"`rbox allow` takes no arguments (got {args[0]}); it reviews everything pending",
+                     "`rbox pending` lists what is waiting")
+    require_human("allow")
+    return review(dirs, approve=True, tsv=False)
+
+
+def review(dirs: Dirs, approve: bool, tsv: bool) -> int:
+    show = not approve
     bwrap = find_bwrap()
     toolchain = dirs.toolchain()
     project = find_project(dirs, bwrap, toolchain, Path.cwd().resolve(), None)
@@ -1371,7 +1381,7 @@ def cmd_status(dirs: Dirs, args: list) -> int:
         return 0
     registry = [r for r in state["rows"] if r.get("source") is not None]
     out.write(f"dependencies   {len(registry)} crates locked, {len(state['pending'])} waiting for approval"
-              + (" (`rbox allow --show`)" if state["pending"] else "") + "\n")
+              + (" (`rbox pending`)" if state["pending"] else "") + "\n")
     local = [r for r in state["rows"] if r.get("source") is None]
     for row in local:
         note = "replaces a crates.io crate" if row.get("patched") else "path dependency"
@@ -1907,7 +1917,8 @@ USAGE = """rbox: build, test and run Rust inside a box.
 
   cargo ...                 the usual commands, boxed (`cargo` on PATH is rbox)
   rbox sync                 download the crates the lockfile names (nothing runs)
-  rbox allow [--show]       review and approve crates that are waiting (a person, own terminal)
+  rbox pending              list the crates that are waiting for approval
+  rbox allow                review and approve them (a person, in their own terminal)
   rbox urgent NAME@VERSION  pull one version past the cooldown (a person)
   rbox status               where things are and what is waiting
   rbox warm                 pre-build after dependency changes
@@ -1961,7 +1972,7 @@ def main(argv: list) -> int:
     if command == "run":
         return cmd_run(dirs, rest, net, extra_env)
     simple = {
-        "sync": cmd_sync, "allow": cmd_allow, "urgent": cmd_urgent, "status": cmd_status, "warm": cmd_warm,
+        "sync": cmd_sync, "allow": cmd_allow, "pending": cmd_pending, "urgent": cmd_urgent, "status": cmd_status, "warm": cmd_warm,
         "export": cmd_export, "clean": cmd_clean, "new": cmd_new, "shell": cmd_shell, "doctor": cmd_doctor,
         "toolchain": cmd_toolchain, "selftest": cmd_selftest,
     }

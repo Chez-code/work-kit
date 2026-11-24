@@ -236,6 +236,11 @@ class Watcher:
                 self._emit(self._fmt(ts, "BASH", str(ev.get("file") or ""), "WARN", "", detail, sub), "yellow")
             return
 
+        if kind == "policy":
+            cmd = str(ev.get("command") or "")[:50]
+            self._emit(self._fmt(ts, "POLICY", "", "REFUSED", "", f"{ev.get('reason', '')}: {cmd}", sub), "yellow")
+            return
+
         if kind not in ("edit", "stop"):
             return
 

@@ -2,6 +2,9 @@
 # Retrofit the Claude Code verification workflow into an existing repo.
 # Usage: ./bootstrap.sh /path/to/repo
 # Idempotent: never overwrites existing files; prints what it skipped.
+# Works for Python, .NET and Rust repos (and mixes): the gate picks its lanes
+# from what the repo contains. Rust also needs rbox on the machine, which
+# rustbox/install.sh sets up; this script only touches the target repo.
 set -euo pipefail
 
 TARGET="${1:?usage: ./bootstrap.sh /path/to/repo}"
@@ -22,6 +25,14 @@ is_dotnet() {
 }
 DOTNET=0
 is_dotnet && DOTNET=1
+# Rust repo? (Cargo.toml at the root — same rule as gate.py's Rust lane.) The
+# Python templates only belong in a repo the Python lane runs in: not .NET,
+# and either not Rust or Rust with a pyproject.toml (PyO3).
+RUST=0
+[ -f "$TARGET/Cargo.toml" ] && RUST=1
+PYTHON=1
+[ "$DOTNET" = 1 ] && PYTHON=0
+[ "$RUST" = 1 ] && [ ! -f "$TARGET/pyproject.toml" ] && PYTHON=0
 
 copy() { # copy <relpath>
   src="$KIT/$1"; dst="$TARGET/$1"
@@ -38,13 +49,17 @@ copy .claude/settings.json
 copy .claude/hooks/gate.py
 copy .claude/hooks/gate_log.py
 copy .claude/hooks/bash_guard.py
+copy .claude/hooks/policy_guard.py
 copy .claude/bin/gate-watch.py
-if [ "$DOTNET" = 1 ]; then
+if [ "$PYTHON" = 1 ]; then
+  copy .pre-commit-config.yaml
+  copy .github/workflows/ci.yml
+elif [ "$DOTNET" = 1 ]; then
   echo "skip (Python-only, .NET repo): .pre-commit-config.yaml"
   echo "skip (Python-only, .NET repo): .github/workflows/ci.yml"
 else
-  copy .pre-commit-config.yaml
-  copy .github/workflows/ci.yml
+  echo "skip (Python-only, Rust repo): .pre-commit-config.yaml"
+  echo "skip (Python-only, Rust repo): .github/workflows/ci.yml"
 fi
 
 # Runtime files the hooks write (event log, loop state, saved tmux style) must
@@ -77,9 +92,12 @@ fi
 echo ""
 echo "Next steps in $TARGET:"
 echo "  1. Edit CLAUDE.md — fill placeholders, write your [LOCKED] specs"
-if [ "$DOTNET" = 1 ]; then
-  echo "  2. Launch 'claude' inside tmux; prefix + W opens the gate watcher pane"
-else
-  echo "  2. pre-commit install && pre-commit autoupdate"
-  echo "  3. Launch 'claude' inside tmux; prefix + W opens the gate watcher pane"
+STEP=2
+if [ "$PYTHON" = 1 ]; then
+  echo "  $STEP. pre-commit install && pre-commit autoupdate"; STEP=$((STEP + 1))
 fi
+if [ "$RUST" = 1 ]; then
+  echo "  $STEP. Rust goes through rbox: run rustbox/install.sh from the kit once per machine,"
+  echo "     then 'rbox doctor' and 'rbox sync' here (see RUST-SETUP.md)"; STEP=$((STEP + 1))
+fi
+echo "  $STEP. Launch 'claude' inside tmux; prefix + W opens the gate watcher pane"

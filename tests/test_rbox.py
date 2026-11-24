@@ -523,6 +523,14 @@ class Approvals(unittest.TestCase):
         confirmed = {key[0] for key in rbox.load_confirmed(self.w.dirs)}
         self.assertEqual(confirmed, {"mac"})
 
+    def test_allow_takes_no_arguments_so_listing_is_a_separate_command(self):
+        # `rbox pending` lists and never approves; `rbox allow` only approves. That keeps a
+        # deny rule on `rbox allow` from also blocking the harmless listing.
+        with self.assertRaises(rbox.Stop):
+            rbox.cmd_allow(self.w.dirs, ["--show"])
+        with self.assertRaises(rbox.Stop):
+            rbox.cmd_allow(self.w.dirs, ["serde"])
+
 
 class SmallThings(unittest.TestCase):
     def test_index_paths(self):
