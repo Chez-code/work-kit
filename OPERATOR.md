@@ -474,6 +474,8 @@ not travel to other machines, and nothing in a repository can grant one.
 | `rbox urgent NAME@VERSION` | pulls one version past the 7-day cooldown | a security fix cannot wait a week; a hijacked release looks the same |
 | `rbox net allow HOST:PORT` | lets `--net` tests and programs reach that host | a host on the list is a way out for data |
 | `rbox export NAME --to FOLDER` | copies a built program out of the box | from there it runs unboxed |
+| `rbox shell` | opens a shell inside the build box | cargo typed there skips the settings rbox pins |
+| `rustbox/install.sh` after the kit's Rust pin changed | switches the machine to another Rust version | which compiler builds your code is your call |
 
 Claude can run everything else, including `rbox sync` (download what the
 lockfile names), `rbox pending`, `rbox status` and `rbox --net cargo test`

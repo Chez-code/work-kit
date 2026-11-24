@@ -46,7 +46,7 @@ compiling, before any of your own code started.
 | A 7-day cooldown | a hijacked release that is caught within days | Cargo's `min-publish-age` (stable since Rust 1.100, 2026-11-12), pinned on the command line, plus rbox's own check at approval time |
 | Exact files are approved by a person | a new or changed crate slipping in unseen | every locked crate file (name, version, checksum) must be in the machine's confirmed set |
 | The session cannot approve itself | an AI assistant adding a dependency on its own | `rbox allow` needs a real terminal and refuses under a Claude session |
-| Network is a list | a test or program reaching anything it likes | `--net` passes only listed `host:port` pairs, through a proxy outside the box |
+| Network is a list, and never for a build | a test or program reaching anything it likes; a build script reaching anything at all | `--net` passes only listed `host:port` pairs, through a proxy outside the box, and only to finished test programs and binaries. Compiling happens first, with no network |
 
 The August 2026 hijack would have been stopped three times over: the cooldown
 (under two hours live), the approval step (a new version of an approved crate,

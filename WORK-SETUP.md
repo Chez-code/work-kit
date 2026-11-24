@@ -131,13 +131,13 @@ and append the three runtime files to the exclude file as bootstrap would.
 **One-time step for the Rust release**: one new hook entry and a
 `permissions.deny` list. `sync.sh` adds the new `policy_guard.py` by itself
 (from this release on it adds any kit file a repo is missing), and a .NET repo
-behaves exactly as before: the guard does nothing without a `Cargo.toml` at
-the repo root. If your hooks live in `settings.local.json`, merge these in by
+behaves exactly as before: the guard does nothing unless the repo holds a
+`Cargo.toml` at its root or one level down. If your hooks live in `settings.local.json`, merge these in by
 hand so the file matches the kit's `settings.json`:
 
 ```json
 "permissions": { "deny": [
-  "Bash(rbox allow:*)", "Bash(rbox urgent:*)", "Bash(rbox export:*)", "Bash(rbox net allow:*)",
+  "Bash(rbox allow:*)", "Bash(rbox urgent:*)", "Bash(rbox export:*)", "Bash(rbox shell:*)", "Bash(rbox net allow:*)",
   "Edit(~/.local/state/rustbox/**)", "Edit(~/.local/share/rustbox/**)", "Edit(~/.cache/rustbox/**)"
 ] },
 "PreToolUse": [

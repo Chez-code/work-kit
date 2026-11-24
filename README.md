@@ -97,9 +97,10 @@ cd /path/to/repo
 one level down) gets `dotnet build` after each edit and `dotnet build` +
 `dotnet test --no-build` at Stop. Multi-solution repos: the gate skips with a
 visible message rather than guess — set `GATE_DOTNET_TARGET` to pin the
-target (the message shows how). A repo with a `Cargo.toml` at the root gets
-`cargo check` after each edit and `cargo fmt --check`, `cargo clippy` and
-`cargo test` at Stop, all through rbox (see RUST-SETUP.md). A repo can have
+target (the message shows how). A repo with a `Cargo.toml` at the root, or in
+a folder one level down, gets `cargo check` after each edit and `cargo fmt
+--check`, `cargo clippy` and `cargo test` at Stop, all through rbox (see
+RUST-SETUP.md). A repo can have
 more than one lane: the edited file picks it, and Stop runs them all. For any
 other stack, swap the commands in `gate.py` — the hook wiring in
 `settings.json` is stack-agnostic. `.pre-commit-config.yaml` and `ci.yml` are
@@ -112,7 +113,8 @@ the whole-gate time budget in seconds, shared by every lane of a run (default
 build/test is reported as a blocking gate failure instead of being silently
 killed by the harness) — `GATE_LOOP_STRIKES`, the number of identical
 consecutive blocks before the gate tells Claude to stop and report (default
-3), and `GATE_RBOX`, the path to rbox when it is not in its default place.
+3), `GATE_RBOX`, the path to rbox when it is not in its default place, and
+`GATE_RUST_DIR`, the folder to run cargo in when several hold a `Cargo.toml`.
 
 In a shared repo, consider putting the hooks block in
 `.claude/settings.local.json` (untracked) rather than committing

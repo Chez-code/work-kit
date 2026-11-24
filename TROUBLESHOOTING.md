@@ -16,8 +16,10 @@ Five hooks, three scripts, two exit codes, one log.
 | Policy guard (`PreToolUse`, `policy_guard.py`) | before every Bash command and file write | nothing | nothing | refuses `rbox allow` / `urgent` / `export` / `net allow`, typing into other terminals, and touching rbox's own folders |
 
 A repo can have more than one lane. The edited file picks the lane; Stop runs
-every lane the repo has, inside one `GATE_TIMEOUT` budget. Python is the lane
-of any repo that is not .NET and is either not Rust or has a `pyproject.toml`.
+every lane the repo has, inside one `GATE_TIMEOUT` budget. A repo counts as
+Rust when it has a `Cargo.toml` at the root or one level down; cargo runs in
+that folder. Python is the lane of any repo that is not .NET and does not have
+a `Cargo.toml` at its root, or has one together with a `pyproject.toml`.
 
 Every gate run past the extension check appends a `start` and an `end`
 line to `.claude/gate-log.jsonl`; `.claude/bin/gate-watch.py` tails it in a
@@ -56,7 +58,8 @@ tmux pane (`prefix + W`) and `--stats` summarises it.
   hook `timeout`, 600), `GATE_DOTNET_TARGET` the solution/project to build when
   auto-detection is ambiguous, `GATE_LOOP_STRIKES` strikes before LOOP
   (default 3), `GATE_RBOX` the path to rbox when it is not at
-  `~/.local/share/rustbox/bin/rbox`.
+  `~/.local/share/rustbox/bin/rbox`, `GATE_RUST_DIR` the one folder to run
+  cargo in when several folders one level down hold a `Cargo.toml`.
 
 ## 2. The diagnostic ladder
 
@@ -148,7 +151,14 @@ Read the result by exit code:
 | Rust repo: `cargo` typed by Claude fails with a namespace or uid-map error, the gate is fine | Claude Code's own sandbox blocks nested sandboxes | list `rbox` and `cargo` under `sandbox.excludedCommands` in `~/.claude/settings.json` |
 | Rust repo: a test fails with `Read-only file system` | the project is read-only inside the box | write under `OUT_DIR`, `CARGO_TARGET_TMPDIR` or `/tmp` |
 | Rust repo: a test cannot reach the network | nothing in the box has a network unless asked | mark it `#[ignore]`; run with `rbox --net cargo test -- --ignored` after a person lists the host (`rbox net allow`) |
-| `[POLICY GUARD] Refused` | Claude tried one of the operator-only rbox commands, or a way around them | expected; do the step yourself if you want it done |
+| `[POLICY GUARD] Refused` | Claude tried one of the operator-only rbox commands, a way around them, or a write to rbox's downloaded crate sources | expected; do the step yourself if you want it done |
+| Rust in a subfolder: `N folders with a Cargo.toml one level down` | more than three Rust folders and no way to guess which matters | prefix the hook command with `GATE_RUST_DIR=<folder>` |
+| `rbox --net cargo test` runs no doc tests | with `--net` only finished test programs are run; nothing is compiled with the network | run doc tests without `--net` |
+| `rbox allow` refuses everything with `crates.io could not be reached` | approving needs a fresh answer about each crate | try again online; `rbox pending` still lists from the last download |
+| `[POLICY GUARD] Refused: rbox's downloaded crate sources are read-only` | a command mentioned rbox's cache and did more than read, or mixed a read with another step | read with `cat`, `grep`, `rg`, `ls`, `find`, `head`; run other steps as a separate command |
+| `rbox: cannot-run: ... holds more than 2,000,000 files outside its caches` | the project, or a `--rw` folder, is too large to search for secret files, and rbox will not search only part of it | move bulk data out, or thin it; rbox warns from 500,000 files on |
+| `--rw ...: that is inside ..., which is hidden in the box` | the folder is in a cache folder, `.git` or `.claude`, which the box covers with an empty folder | choose another folder for the program's output |
+| `install.sh` stops with `it would switch this machine from Rust A to Rust B` | the kit's pinned Rust changed and a session ran the installer | a person runs `rustbox/install.sh` in their own terminal |
 | `another cargo wins` from `rbox doctor` | rustup or a distro cargo comes before `~/.local/bin` on PATH | put `~/.local/bin` first, or remove the other cargo; it builds outside the box |
 
 ### Rung 3b — the kit's own tests

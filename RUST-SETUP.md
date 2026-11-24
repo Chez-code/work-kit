@@ -47,7 +47,9 @@ rbox doctor --online
 rbox selftest
 ```
 
-`install.sh` never uses sudo and touches only the home folder:
+`install.sh` never uses sudo and touches only the home folder. The first
+install can be run by a Claude session. Changing an installed machine from one
+Rust version to another is a **PERSON** step: `install.sh` stops and says so.
 
 | Path | What |
 |---|---|
@@ -145,13 +147,25 @@ Things that differ from plain cargo:
   writes into the source tree fails. Write under the build output
   (`OUT_DIR`, `CARGO_TARGET_TMPDIR`) or `/tmp` instead.
 - **`.git`, `.claude`, `.mcp.json`, `.env`, `.env.*`, `.envrc`, `.netrc`, `.npmrc`
-  and `.pypirc` are hidden in the box**, wherever they are in the project.
-  Keep keys out of the project tree anyway and pass them at run time:
-  `rbox run --env API_KEY -- NAME`.
+  and `.pypirc` are hidden in the box**, wherever they are in the project,
+  including under a folder you make writable with `--rw`. Folders a Rust build
+  has no use for are hidden whole: `node_modules`, `__pycache__`, Python
+  virtualenvs, and cache folders such as an old `target/` left by plain cargo.
+  Every other folder is searched, whatever it is called. A project (or a
+  `--rw` folder) with more than two million files is not searched in part:
+  rbox does not run there, and it warns from 500,000 on. Keep bulk data in a
+  folder of its own. Keep keys out of the project tree anyway and pass them
+  at run time: `rbox run --env API_KEY -- NAME`.
 - **To read a dependency's source**, look under the "crate sources" path that
-  `rbox status` prints.
+  `rbox status` prints. Reading is all a session may do there: the guard
+  refuses any command that mentions rbox's cache and does more than look
+  (`cat`, `grep`, `rg`, `ls`, `find`, `head`, `wc`, `jq`). Those files are
+  what the person approved.
 - **A built program leaves the box only through `rbox export NAME --to FOLDER`**,
   which is a **PERSON** step and prints the file's sha256.
+- **`rbox shell` opens a shell inside the build box**, to look at what the box
+  can see. It is a **PERSON** step and needs every crate approved: cargo typed
+  in that shell runs without the settings rbox pins on its own cargo commands.
 - **A boxed command stops when the shell that started it exits.** That is
   what keeps a killed session from leaving builds behind. Run a long job in
   tmux, or as a service.
@@ -167,7 +181,10 @@ Things that differ from plain cargo:
    published, whether it has a build script or is a proc macro, and which of
    your dependencies pulls it in. Crates that run code at build time are
    listed first and confirmed separately. A crate that runs code and is
-   younger than 30 days is confirmed by typing its name.
+   younger than 30 days is confirmed by typing its name, and so is a version
+   its authors have yanked. rbox asks crates.io again about every pending
+   crate at that moment, so approving needs crates.io to be reachable: a
+   version that was removed since the download is refused.
 4. A version younger than 7 days cannot be approved. Wait, or for a security
    fix **PERSON** runs `rbox urgent NAME@VERSION`, which pulls that one
    version past the cooldown and leaves a dated note.
@@ -199,20 +216,29 @@ rbox run --net --env API_KEY -- recorder    # a program
   and offers it inside as `HTTPS_PROXY`. Only `CONNECT` to a listed
   `host:port` gets through; every connection is logged in the project's state
   folder (`net.log`).
+- **Compiling never gets the network, even with `--net`.** `rbox --net cargo
+  test` first builds in the ordinary box with no network, then runs only the
+  finished test programs with the proxy. `rbox --net cargo run` does the same
+  for one binary. Build scripts and proc macros never see the proxy. Doc
+  tests are not run with `--net`.
 - **The code has to use the proxy.** `reqwest` does on its own. A raw TCP or
   WebSocket client needs a short `CONNECT` step first; `RUST-STACK.md` has it.
   TCP only.
 - A listed name that resolves to a local or private address is refused. To
   reach a service on this machine or network, list its address literally
   (`127.0.0.1:8765`).
-- `build`, `check`, `clippy` and `doc` never get network, and the gate's
+- `build`, `check`, `clippy`, `doc` and `bench` refuse `--net`, and the gate's
   `cargo test` runs without it. Mark live tests `#[ignore]`.
 - Do not list general-purpose hosts (code hosting, paste sites, object
   storage): a hostile crate could use them to send data out.
 
 ## What the gate does in a Rust repo
 
-The Rust lane is on when the repo has a `Cargo.toml` at its root.
+The Rust lane is on when the repo has a `Cargo.toml` at its root, or in a
+folder one level down (a C# or Python repo that keeps its Rust in a
+subfolder). cargo then runs inside that folder. With more than three such
+folders the gate skips visibly and asks for `GATE_RUST_DIR=<folder>` as a
+prefix in the hook command. The policy guard is active under the same test.
 
 | When | Runs |
 |---|---|
@@ -235,7 +261,7 @@ repo has, inside the one `GATE_TIMEOUT` budget.
 
 ```bash
 git -C ~/work-kit pull
-~/work-kit/rustbox/install.sh          # updates rbox; reinstalls the toolchain only if the pin changed
+~/work-kit/rustbox/install.sh          # updates rbox; a changed Rust pin needs a PERSON to run this
 ~/work-kit/sync.sh /path/to/repo
 rbox doctor && rbox selftest
 ```
