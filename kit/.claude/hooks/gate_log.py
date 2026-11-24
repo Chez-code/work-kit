@@ -129,10 +129,32 @@ _DOTNET_BUILD = re.compile(r"error ((?:CS|MSB|NU|NETSDK)\d+): (.+?)(?:\s\[|$)")
 _DOTNET_TEST = re.compile(r"^\s*Failed (\S+)")
 _TIMEOUT = re.compile(r"timed out after \d+s")
 _ERRORISH = re.compile(r"error|fail", re.IGNORECASE)
+# Rust, through rbox. Real captures (cargo 1.100, --message-format=short):
+#   src/main.rs:6:18: error[E0308]: mismatched types: expected `i64`, found `&str`
+#   src/main.rs:2:5: error: unneeded `return` statement           (clippy, -D warnings)
+#   test tests::multiplies ... FAILED
+#   Diff in /abs/path/src/main.rs:1:                               (cargo fmt --check)
+#   rbox: refused: the dependencies changed since the crates were last downloaded
+_RUST_SHORT = re.compile(r"^(\S+?):\d+:\d+: error(?:\[(E\d{4})\])?: (.+)$")
+_RUST_TEST = re.compile(r"^test (.+?) \.\.\. FAILED\b")
+_RUST_FMT = re.compile(r"^Diff in (\S+?):\d+:")
+_RBOX = re.compile(r"^rbox: (refused|cannot-run|waiting): (.+)$")
+_LINE_NO = re.compile(r" \(line \d+\)")
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def strip_control(text: str) -> str:
+    """Drop control characters (keeps newline and tab).
+
+    Gate output is fed back to Claude and its keys are printed in the
+    operator's terminal; build and test output can carry bytes chosen by
+    someone else, including terminal escape sequences.
+    """
+    return _CONTROL.sub("", text)
 
 
 def _cut(text: str) -> str:
-    text = " ".join(text.split())
+    text = " ".join(strip_control(text).split())
     return text[:KEY_MAX]
 
 
@@ -181,6 +203,23 @@ def failure_keys(text: str) -> list[str]:
         m = _DOTNET_TEST.match(line)
         if m:
             add(_cut(m.group(1)))
+            continue
+        m = _RUST_SHORT.match(line)
+        if m:
+            path, code, message = m.group(1), m.group(2), m.group(3)
+            add(_cut(f"{code}:{path}") if code else _cut(f"rust:{path}:{message}"))
+            continue
+        m = _RUST_TEST.match(line)
+        if m:
+            add(_cut("test " + _LINE_NO.sub("", m.group(1))))
+            continue
+        m = _RUST_FMT.match(line)
+        if m:
+            add(_cut("fmt:" + "/".join(m.group(1).split("/")[-2:])))
+            continue
+        m = _RBOX.match(line)
+        if m:
+            add(_cut(f"rbox:{m.group(1)}:" + re.sub(r"\d", "", m.group(2))))
             continue
         if _TIMEOUT.search(line):
             add("timeout")

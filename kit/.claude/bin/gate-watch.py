@@ -68,6 +68,18 @@ def base(path: str | None) -> str:
     return os.path.basename(path.rstrip("/")) or path
 
 
+CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def rust_checks_ran(ran: list | None) -> bool:
+    """True when this run really compiled the Rust code (check, clippy or test)."""
+    for cmd in ran or []:
+        toks = str(cmd).split()
+        if "cargo" in toks[:-1] and toks[toks.index("cargo") + 1] in ("check", "clippy", "test"):
+            return True
+    return False
+
+
 def ran_summary(ran: list | None) -> str:
     names: list[str] = []
     for cmd in ran or []:
@@ -76,6 +88,8 @@ def ran_summary(ran: list | None) -> str:
             continue
         if base(toks[0]) == "dotnet" and len(toks) > 1:
             names.append(toks[1])
+        elif "cargo" in toks[:-1]:
+            names.append("cargo " + toks[toks.index("cargo") + 1])
         elif "ruff" in toks:
             names.append("ruff")
         elif "pytest" in toks:
@@ -156,11 +170,22 @@ class Watcher:
         self.history: dict[str, list[dict]] = defaultdict(list)  # session -> edit ends since prompt
         self.last_verdict: dict[str, str] = {}
         self.keys: dict[str, list[str]] = {}
+        # Sticky: set when a run reports crates waiting for approval, cleared only
+        # by a run in which the Rust checks really executed. Until then nothing
+        # in Rust is verified, whatever the lines in between say.
+        self.unverified_since = ""
         tmux.repaint_red()  # a previous watcher may have died red; stay red until a restore
 
     # -- output
 
+    def _restore(self) -> None:
+        if not self.unverified_since:
+            self.tmux.restore()
+
     def _emit(self, text: str, level: str = "plain") -> None:
+        text = CONTROL.sub("", text)  # log fields can carry bytes from build output
+        if self.unverified_since and "UNVERIFIED" not in text:
+            text += f"   [UNVERIFIED since {self.unverified_since}]"
         if level == "red":
             line = f"{RED}{text}{RESET}" if self.color else text
             sys.stdout.write(line + "\a\n")
@@ -191,7 +216,7 @@ class Watcher:
             self.last_verdict[session] = ""
             self.keys[session] = []
             self._emit(self._fmt(ts, "PROMPT", "", "", "", "strikes reset", sub))
-            self.tmux.restore()
+            self._restore()
             return
 
         if ev.get("phase") == "start":
@@ -225,14 +250,21 @@ class Watcher:
         file = str(ev.get("file") or "")
         label = kind.upper()
 
-        if verdict == "green":
+        if self.unverified_since and verdict in ("green", "block", "loop", "released") and rust_checks_ran(ev.get("ran")):
+            self.unverified_since = ""
+            self._emit(self._fmt(ts, label, file, "verified again", "", "the Rust checks ran", sub))
+
+        if verdict == "pending":
+            self.unverified_since = self.unverified_since or ts[11:19]
+            self._emit(self._fmt(ts, label, file, "UNVERIFIED", dur, str(ev.get("reason") or "")[:90], sub), "red")
+        elif verdict == "green":
             summary = ran_summary(ev.get("ran"))
             if summary == "nothing ran":
                 self._emit(self._fmt(ts, label, file, "green", dur, "nothing ran", sub), "yellow")
             else:
                 self._emit(self._fmt(ts, label, file, "green", dur, summary if kind == "stop" else "", sub))
             if kind == "stop":
-                self.tmux.restore()
+                self._restore()
         elif verdict == "block":
             self._emit(self._fmt(ts, label, file, "BLOCK", dur, f"{first_key}{more}   strike {strike}", sub), "yellow")
         elif verdict == "loop":
@@ -244,7 +276,7 @@ class Watcher:
         elif verdict == "released":
             if ev.get("result") == "green":
                 self._emit(self._fmt(ts, label, file, "released green", dur, ran_summary(ev.get("ran")), sub))
-                self.tmux.restore()
+                self._restore()
             else:
                 self._emit(self._fmt(ts, label, file, "RELEASED still failing", dur, f"{first_key}{more}", sub), "red")
         else:

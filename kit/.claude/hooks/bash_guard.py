@@ -20,7 +20,8 @@ outright with exit 2 and a one-line reason. Not wired by default.
 Target rule: a path counts only if it has a source extension AND resolves
 inside the repo root. Scratch files under /tmp and the like are ignored.
 In the Python lane a target must also exist (ruff needs the file); in the
-.NET lane the build is repo-wide so existence is not checked.
+.NET and Rust lanes the build is repo-wide, so existence is not checked and
+one re-run covers every touched file of that lane.
 
 Time budget: one deadline for the whole guard (GATE_TIMEOUT, default 540),
 the remainder handed to each gate subprocess as its own GATE_TIMEOUT, so two
@@ -45,9 +46,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gate_log  # noqa: E402
 from gate import DOTNET_EXTS, PYTHON_EXTS, is_dotnet  # noqa: E402
 
+try:
+    from gate import LANE_EXTS, active_lanes  # noqa: E402
+except ImportError:
+    # gate.py from an older kit release (sync.sh refused it because a .prev was
+    # in the way): fall back to the two lanes that gate.py knows.
+    LANE_EXTS = {"dotnet": DOTNET_EXTS, "python": PYTHON_EXTS}
+
+    def active_lanes(root: Path) -> list[str]:
+        return ["dotnet"] if is_dotnet(root) else ["python"]
+
+WHOLE_REPO_LANES = ("dotnet", "rust")  # one build covers the repo: a single re-run is enough
+
 SOURCE_EXTS = (
     ".py", ".cs", ".csproj", ".sln", ".slnx", ".md", ".json", ".toml", ".yaml", ".yml",
-    ".cfg", ".ini", ".txt", ".ts", ".js", ".sh",
+    ".cfg", ".ini", ".txt", ".ts", ".js", ".sh", ".rs", "Cargo.lock",
 )
 SEPARATORS = {"&&", "||", ";", "|", "&"}
 # Shapes that block mode refuses: each has an Edit/Write equivalent Claude can
@@ -316,27 +329,25 @@ def main() -> int:
         return 2
 
     deadline = time.monotonic() + _budget()
-    dotnet = is_dotnet(root)
+    lanes = active_lanes(root)
 
-    # Decide which targets get a gate re-run.
+    # Decide which targets get a gate re-run: the file picks its lane, as in gate.py.
     to_run: list[str] = []
     notes: list[str] = []
-    if dotnet:
-        buildable = [p for p in files if p.endswith(DOTNET_EXTS)]
-        if buildable:
-            to_run = [buildable[0]]  # the build is repo-wide: once is enough
-        others = [p for p in files if not p.endswith(DOTNET_EXTS)]
-        if others and not buildable:
-            notes.append("not gated")
-    else:
-        for p in files:
-            if p.endswith(PYTHON_EXTS):
-                if os.path.exists(p):
-                    to_run.append(p)
-                else:
-                    notes.append("target not found")
+    covered: set[str] = set()
+    for p in files:
+        lane = next((name for name in lanes if p.endswith(LANE_EXTS[name])), None)
+        if lane in WHOLE_REPO_LANES:
+            if lane not in covered:
+                covered.add(lane)
+                to_run.append(p)  # the build is repo-wide: once per lane is enough
+        elif lane == "python":
+            if os.path.exists(p):
+                to_run.append(p)
             else:
-                notes.append("not gated")
+                notes.append("target not found")
+        else:
+            notes.append("not gated")
     if not files:
         notes.append("target unknown")
 
