@@ -1,0 +1,17 @@
+# Rust toolchain pin for rbox. Written by rustbox/pin.py from the release manifest,
+# after checking the manifest's signature against the Rust release key
+# (fingerprint 108F66205EAEB0AAA8DD5E1C85AB96E6FA1BE5FE).
+# manifest: https://static.rust-lang.org/dist/channel-rust-1.100.0.toml
+# manifest sha256: 3051e859570f64a8c5acb9d09e87425db52c7d97287c67e8f6d57d7d34ef9258
+# Lines: <machine triple> <sha256> <url>. Install verifies every hash.
+version 1.100.0
+aarch64-unknown-linux-gnu fcbfa5b8a0cb28f0c4edfb6dda6910ee910993db31f05258613f5cd5b851263a https://static.rust-lang.org/dist/2026-11-12/rustc-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+aarch64-unknown-linux-gnu d07ee80eb6ba3c5845c554ac88086e1ff5d63f83d99c3c09cb32504cbedd6844 https://static.rust-lang.org/dist/2026-11-12/cargo-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+aarch64-unknown-linux-gnu c73f62fbe5d837f9807ed9e0076575dd8d3475c79af2b30e3570d328e6713f8f https://static.rust-lang.org/dist/2026-11-12/rust-std-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+aarch64-unknown-linux-gnu 941f71acaf2a181d66776b3b889b72d64a90cc405b8f6c41a4b5ac8cd99a36b1 https://static.rust-lang.org/dist/2026-11-12/clippy-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+aarch64-unknown-linux-gnu f99f80bcd169e8d7de018498d61a544315ead2060fb1e7d515f8ac82c088ef83 https://static.rust-lang.org/dist/2026-11-12/rustfmt-1.100.0-aarch64-unknown-linux-gnu.tar.xz
+x86_64-unknown-linux-gnu f1d0b1dec81dab6f523cd098507763487b0d4bd7fd2c87582f154128719be03b https://static.rust-lang.org/dist/2026-11-12/rustc-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+x86_64-unknown-linux-gnu 7e29ce07d7c6e92d1826870575ba27d57fff6cb3e754aa57d99099cb88fab35d https://static.rust-lang.org/dist/2026-11-12/cargo-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+x86_64-unknown-linux-gnu 4591b6486594ded52ecd6135db95bf9355bbd3ca7a380888b141528bbcf9a5d4 https://static.rust-lang.org/dist/2026-11-12/rust-std-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+x86_64-unknown-linux-gnu 0d18df3bff6c852ef8243727fed075ecb33dbf93b8ab8c138c2f45e3f270102a https://static.rust-lang.org/dist/2026-11-12/clippy-1.100.0-x86_64-unknown-linux-gnu.tar.xz
+x86_64-unknown-linux-gnu 4c9389e4722b16499e5d47d89837ec84a4ef755f105ed2a84c038156064e01ab https://static.rust-lang.org/dist/2026-11-12/rustfmt-1.100.0-x86_64-unknown-linux-gnu.tar.xz

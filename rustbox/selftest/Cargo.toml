@@ -1,0 +1,7 @@
+# rbox self-test: a deliberately hostile workspace. `rbox selftest` copies it to a
+# scratch folder, builds, tests and runs it in the box, and checks that every
+# attempt to read secrets, reach the network or write outside the build output
+# fails. It has no dependencies, so it needs no network and no approvals.
+[workspace]
+members = ["hostile", "hostile-macro"]
+resolver = "3"
