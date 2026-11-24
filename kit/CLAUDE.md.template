@@ -60,6 +60,11 @@ now.
 5. `[LOOP DETECTED]` means the same failure blocked three edits in a row.
    Do not try a fourth fix. Stop, and report what was tried and why each
    attempt failed; the operator decides whether to rewind.
+6. Rust repos: `rbox: waiting: ... await approval` means crates need the
+   operator's approval, which only they can give (`rbox allow`, in their own
+   terminal). The Rust checks did not run. Do not remove or swap the
+   dependency, copy its code into the repo, or look for another way to
+   build. Say which crates are waiting and why you need them, then stop.
 
 ## Commands
 

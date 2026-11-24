@@ -5,14 +5,19 @@ session asked to debug the gate. Both start from the same mental model.
 
 ## 1. Mental model (read this first)
 
-Four hooks, two scripts, two exit codes, one log.
+Five hooks, three scripts, two exit codes, one log.
 
-| Hook | Fires when | Python repo | .NET repo |
-|---|---|---|---|
-| Edit gate (`PostToolUse`, matcher `Write\|Edit\|MultiEdit`, `gate.py`) | after every file write by a tool | `.py` only: clear stale `.pyc`, `ruff check --fix --output-format concise`, `pytest -x -q` | `.cs/.csproj/.sln/.slnx` only: `dotnet build <target>` |
-| Stop gate (`Stop`, `gate.py --stop`) | when Claude tries to declare the task done | full `pytest -q` | `dotnet build <target>` then `dotnet test --no-build <target>` |
-| Bash guard (`PostToolUse`, matcher `Bash`, `bash_guard.py`) | after every Bash command | if the command wrote/moved/deleted a source file inside the repo: log a `bash` event, re-run the edit gate on that file, report | same |
-| Prompt reset (`UserPromptSubmit`, `gate.py --new-prompt`) | on every prompt you send | delete `.claude/gate-state.json`, log a `prompt` event, print nothing | same |
+| Hook | Fires when | Python repo | .NET repo | Rust repo |
+|---|---|---|---|---|
+| Edit gate (`PostToolUse`, matcher `Write\|Edit\|MultiEdit`, `gate.py`) | after every file write by a tool | `.py` only: clear stale `.pyc`, `ruff check --fix --output-format concise`, `pytest -x -q` | `.cs/.csproj/.sln/.slnx` only: `dotnet build <target>` | `.rs`, `Cargo.toml`, `Cargo.lock` only: `rbox cargo check --workspace --all-targets` |
+| Stop gate (`Stop`, `gate.py --stop`) | when Claude tries to declare the task done | full `pytest -q` | `dotnet build <target>` then `dotnet test --no-build <target>` | `cargo fmt --check`, `cargo clippy -D warnings`, then `cargo test`, all through rbox |
+| Bash guard (`PostToolUse`, matcher `Bash`, `bash_guard.py`) | after every Bash command | if the command wrote/moved/deleted a source file inside the repo: log a `bash` event, re-run the edit gate on that file, report | same | same |
+| Prompt reset (`UserPromptSubmit`, `gate.py --new-prompt`) | on every prompt you send | delete `.claude/gate-state.json`, log a `prompt` event, print nothing | same | same |
+| Policy guard (`PreToolUse`, `policy_guard.py`) | before every Bash command and file write | nothing | nothing | refuses `rbox allow` / `urgent` / `export` / `net allow`, typing into other terminals, and touching rbox's own folders |
+
+A repo can have more than one lane. The edited file picks the lane; Stop runs
+every lane the repo has, inside one `GATE_TIMEOUT` budget. Python is the lane
+of any repo that is not .NET and is either not Rust or has a `pyproject.toml`.
 
 Every gate run past the extension check appends a `start` and an `end`
 line to `.claude/gate-log.jsonl`; `.claude/bin/gate-watch.py` tails it in a
@@ -22,8 +27,16 @@ tmux pane (`prefix + W`) and `--stats` summarises it.
   the thing to fix. **Exit 1** = the gate itself crashed (a traceback) — that is
   a bug in the gate, not a verdict on the code, and it does NOT block.
 - **Skips are visible.** When the gate cannot run (no `dotnet` on PATH, zero or
-  several solutions) it prints a `systemMessage` JSON line on stdout and exits 0.
-  If you see `[gate] ... no verification is running`, nothing is being checked.
+  several solutions, no rbox or no sandbox on the machine) it prints a
+  `systemMessage` JSON line on stdout and exits 0. If you see `[gate] ... no
+  verification is running` or `... are NOT running`, nothing is being checked.
+- **Waiting is not blocking.** In a Rust repo, crates that a person has not
+  approved yet stop the build (rbox exit 5). The gate does not block on that,
+  because Claude cannot fix it: it prints `Rust checks did not run: N crates
+  await approval`, logs a `pending` verdict, and the watcher shows
+  `UNVERIFIED` on every line until a run in which check, clippy or test really
+  executed. Formatting is still enforced meanwhile. Approve with `rbox allow`
+  in your own terminal.
 - **Once per stop.** The Stop gate blocks the first stop attempt; the second
   consecutive attempt is let through (`stop_hook_active` anti-loop guard). A red
   suite can therefore still be handed back — the last `[STOP GATE FAILED]` text
@@ -42,7 +55,8 @@ tmux pane (`prefix + W`) and `--stats` summarises it.
   `GATE_TIMEOUT` whole-gate budget in seconds (default 540, must stay below the
   hook `timeout`, 600), `GATE_DOTNET_TARGET` the solution/project to build when
   auto-detection is ambiguous, `GATE_LOOP_STRIKES` strikes before LOOP
-  (default 3).
+  (default 3), `GATE_RBOX` the path to rbox when it is not at
+  `~/.local/share/rustbox/bin/rbox`.
 
 ## 2. The diagnostic ladder
 
@@ -57,11 +71,14 @@ grep -n 'gate.py\|bash_guard.py' .claude/settings.local.json .claude/settings.js
 ls -l .claude/hooks/gate.py .claude/hooks/gate_log.py .claude/hooks/bash_guard.py .claude/bin/gate-watch.py
 ```
 
-Four hook entries are expected: gate.py (PostToolUse), bash_guard.py
-(PostToolUse Bash), gate.py --new-prompt (UserPromptSubmit), gate.py --stop
-(Stop). gate.py imports gate_log.py from its own directory; if that file is
-missing every gate run crashes with `ModuleNotFoundError` (exit 1, nothing
-blocked). `sync.sh` restores it.
+Five hook entries are expected: policy_guard.py (PreToolUse), gate.py
+(PostToolUse), bash_guard.py (PostToolUse Bash), gate.py --new-prompt
+(UserPromptSubmit), gate.py --stop (Stop). gate.py imports gate_log.py from
+its own directory; if that file is missing every gate run crashes with
+`ModuleNotFoundError` (exit 1, nothing blocked). `sync.sh` restores it, and
+adds any kit file a newer release introduced. The policy guard's hook command
+does nothing when its file is absent, so a half-updated repo cannot block
+every tool call.
 
 - A `Settings Error` banner at Claude startup = the settings file is not strict
   JSON (a `//` comment or trailing comma). Fix the file; nothing else works
@@ -80,7 +97,7 @@ This removes Claude Code from the picture entirely.
 ```bash
 # Stop path
 echo '{"cwd":"'"$PWD"'"}' | python3 .claude/hooks/gate.py --stop; echo "exit=$?"
-# Edit path (swap the extension to match your stack: X.cs / x.py)
+# Edit path (swap the extension to match your stack: X.cs / x.py / src/main.rs)
 echo '{"cwd":"'"$PWD"'","tool_input":{"file_path":"X.cs"}}' | python3 .claude/hooks/gate.py; echo "exit=$?"
 # Bash guard (expect a systemMessage JSON line and exit 0 on a green repo)
 echo '{"cwd":"'"$PWD"'","tool_input":{"command":"sed -i s/a/b/ X.cs"}}' | python3 .claude/hooks/bash_guard.py; echo "exit=$?"
@@ -95,7 +112,7 @@ Read the result by exit code:
 | exit | meaning | next step |
 |---|---|---|
 | 0, no output | passed (or non-code extension, which is silent) | Rung 3 if you expected a block |
-| 0, `systemMessage` line | gate skipped, says why | do what the message says (PATH, `GATE_DOTNET_TARGET`) |
+| 0, `systemMessage` line | gate skipped, or Rust is waiting for an approval; it says which | do what the message says (PATH, `GATE_DOTNET_TARGET`, `rustbox/install.sh`, `rbox allow`) |
 | 2 | blocked; stderr shows the failing command's last 40 lines | run that command by hand for the full output |
 | 1, traceback | gate bug | capture the traceback; that is the bug report |
 
@@ -121,6 +138,18 @@ Read the result by exit code:
 | Guard says `target not found` | Python lane, relative path after a `cd` the guard could not follow, or the file really is gone | harmless: nothing was verified for it; ask Claude to use Edit |
 | `ruff: error: unrecognized ... --output-format` | ruff older than 2023 pinned in the project | upgrade ruff, or drop the two `--output-format concise` tokens in gate.py (the full-format fallback still extracts keys) |
 | Every gate run exits 1 with `ModuleNotFoundError: gate_log` | `gate_log.py` missing next to `gate.py` | `sync.sh` the repo |
+| Rust repo: `rbox is not installed` on every edit | rbox was never installed on this machine | `rustbox/install.sh` from the kit checkout; `rbox doctor` |
+| Rust repo: `rbox cannot run here` | no bubblewrap, sandboxes restricted by the distro, or no toolchain | `rbox doctor` names the cause and the one sudo line a person runs |
+| Rust repo: `Rust checks did not run: N crates await approval` | new or changed crate files that nobody has approved on this machine | `rbox pending` to see them; a person runs `rbox allow` in their own terminal |
+| Rust repo: watcher shows `UNVERIFIED` long after an approval | no gate run has compiled anything since | make one `.rs` edit or stop once; the line clears when check, clippy or test runs |
+| Rust repo: blocked with `the dependencies changed since the crates were last downloaded` | `Cargo.lock` changed (a pull, a checkout, a hand edit) | `rbox sync` (downloads only); Claude may run it |
+| Rust repo: `there is no Cargo.lock yet` | fresh clone of a library, or a new project made without `rbox new` | `rbox sync` |
+| Rust repo: first gate run after adding crates times out | cold build of every dependency inside the 540 s budget | `rbox warm` once, outside the gate |
+| Rust repo: `cargo` typed by Claude fails with a namespace or uid-map error, the gate is fine | Claude Code's own sandbox blocks nested sandboxes | list `rbox` and `cargo` under `sandbox.excludedCommands` in `~/.claude/settings.json` |
+| Rust repo: a test fails with `Read-only file system` | the project is read-only inside the box | write under `OUT_DIR`, `CARGO_TARGET_TMPDIR` or `/tmp` |
+| Rust repo: a test cannot reach the network | nothing in the box has a network unless asked | mark it `#[ignore]`; run with `rbox --net cargo test -- --ignored` after a person lists the host (`rbox net allow`) |
+| `[POLICY GUARD] Refused` | Claude tried one of the operator-only rbox commands, or a way around them | expected; do the step yourself if you want it done |
+| `another cargo wins` from `rbox doctor` | rustup or a distro cargo comes before `~/.local/bin` on PATH | put `~/.local/bin` first, or remove the other cargo; it builds outside the box |
 
 ### Rung 3b — the kit's own tests
 
@@ -129,7 +158,9 @@ From the kit checkout, not the target repo:
 ```bash
 cd ~/work-kit
 python3 -m unittest discover tests     # key extraction, state file, guard matcher
-tests/smoke.sh                         # end-to-end with a fake dotnet; no SDK needed
+tests/smoke.sh                         # end-to-end with a fake dotnet and a fake rbox; no SDK needed
+python3 tests/rust/test_online.py      # Rust only: real cargo, real crates (needs rbox installed)
+rbox selftest                          # Rust only: the box itself, with a hostile crate
 ```
 
 Both green means the scripts are fine and the problem is wiring or
@@ -144,6 +175,7 @@ mkdir -p /tmp/gate-scratch && cd /tmp/gate-scratch && git init -q
 ~/work-kit/bootstrap.sh .
 # Python: uv init -q && mkdir tests && printf 'def test_x():\n    assert False\n' > tests/test_x.py
 # .NET:   dotnet new xunit -o Tests -n Tests
+# Rust:   run `rbox new scratch` instead of the mkdir, then git init and bootstrap inside it
 claude          # ask for one trivial edit, watch Ctrl+O for the gate line
 ```
 
@@ -152,9 +184,12 @@ next `.py`/`.cs` edit and a `[STOP GATE FAILED]` when Claude tries to stop. If
 the scratch repo behaves and the real one does not, diff the two
 `.claude/` directories — the difference is the bug.
 
-### Rung 5 — no dotnet on this machine
+### Rung 5 — no dotnet (or no rbox) on this machine
 
-Put a recording shim first on PATH and read what the gate would have run:
+Put a recording shim first on PATH and read what the gate would have run. For
+the Rust lane the shim is named by `GATE_RBOX` instead of found on PATH:
+`GATE_RBOX=/tmp/shim/rbox`, a script that logs `$*` and exits 0 (green),
+101 (a compile error), 3, 4 or 5 (rbox's refused, cannot-run, waiting).
 
 ```bash
 mkdir -p /tmp/shim && printf '#!/bin/sh\necho "dotnet $*" >> /tmp/shim/calls.log\nexit 0\n' > /tmp/shim/dotnet && chmod +x /tmp/shim/dotnet
@@ -210,6 +245,10 @@ the working agreement in CLAUDE.md, not a bigger parser.
 - **Do not disable hooks to get unstuck.** Fix the cause via the ladder. If a
   gate is genuinely wrong, `GATE_TIMEOUT` and `GATE_DOTNET_TARGET` are the
   knobs; the example async Stop file is the escape hatch for slow suites.
+- **Rust: approve crates yourself, and promptly.** While crates wait, nothing
+  in Rust is verified and the watcher says so on every line. Read the
+  `rbox allow` table rather than typing yes at it: the rows that run code at
+  build time and the recently published ones are the ones that matter.
 - **Keep the edit-time check fast.** Python: `-x` fails fast by design. .NET:
   point `GATE_DOTNET_TARGET` at the project you are working in if the whole
   solution builds slowly; the Stop gate can still target the full solution

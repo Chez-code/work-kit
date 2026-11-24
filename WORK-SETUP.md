@@ -128,6 +128,27 @@ Then run `sync.sh` (it installs `gate_log.py`, `bash_guard.py` and
 before this release, copy them once: `cp ~/work-kit/kit/.claude/hooks/{gate_log,bash_guard}.py .claude/hooks/ && mkdir -p .claude/bin && cp ~/work-kit/kit/.claude/bin/gate-watch.py .claude/bin/`),
 and append the three runtime files to the exclude file as bootstrap would.
 
+**One-time step for the Rust release**: one new hook entry and a
+`permissions.deny` list. `sync.sh` adds the new `policy_guard.py` by itself
+(from this release on it adds any kit file a repo is missing), and a .NET repo
+behaves exactly as before: the guard does nothing without a `Cargo.toml` at
+the repo root. If your hooks live in `settings.local.json`, merge these in by
+hand so the file matches the kit's `settings.json`:
+
+```json
+"permissions": { "deny": [
+  "Bash(rbox allow:*)", "Bash(rbox urgent:*)", "Bash(rbox export:*)", "Bash(rbox net allow:*)",
+  "Edit(~/.local/state/rustbox/**)", "Edit(~/.local/share/rustbox/**)", "Edit(~/.cache/rustbox/**)"
+] },
+"PreToolUse": [
+  { "matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit", "hooks": [ { "type": "command",
+    "command": "[ -f \"$CLAUDE_PROJECT_DIR/.claude/hooks/policy_guard.py\" ] || exit 0; python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/policy_guard.py\"", "timeout": 10 } ] }
+]
+```
+
+(`PreToolUse` goes inside `"hooks"`, next to `PostToolUse`.) Rust itself is
+set up per machine: see `RUST-SETUP.md`.
+
 ## Smoke test (run in the repo)
 
 Exercises both real dotnet paths without waiting for an organic edit:

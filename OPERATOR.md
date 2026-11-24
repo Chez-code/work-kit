@@ -426,7 +426,71 @@ No skip message and `exit=0` on a green solution means the target resolved.
 In a session, `/hooks` shows the command string Claude Code loaded, prefix
 included.
 
-## 8. A note on what the operator does not do
+## 8. Rust repos: crates wait for you
+
+In a Rust repo, `cargo` is rbox: it runs in a sandbox (`RUST-SETUP.md`). Most
+of that is invisible. One part is yours alone, because the scripts are built
+so that Claude cannot do it.
+
+### Approving crates
+
+A crate file (a name, a version and a checksum) can only be built after a
+person has approved it on this machine. When Claude adds or updates a
+dependency, or a pull changes `Cargo.lock`, the build stops and the gate says:
+
+```
+[gate] Rust checks did not run: 3 crates await approval: ... Nothing in Rust is verified.
+```
+
+The gate does not block on this. Claude is told to stop and hand over, and
+the watcher marks every line `UNVERIFIED` until the checks really run again.
+What you do, in your own terminal pane:
+
+```bash
+rbox pending     # optional: the same table, without approving
+rbox allow
+```
+
+Read the table before you type yes:
+
+- **Runs code at build time** is listed first. A build script or a proc macro
+  runs on your machine during the build, even if your program never calls it.
+- **Published N days ago.** Under 7 days is refused outright; a crate that
+  runs code and is under 30 days old has to be confirmed by typing its name.
+- **`1.0.101 -> 1.0.103`** is a version change of something you approved
+  before. A row marked `(new)` is a crate you have never approved.
+- **via X** is which of your dependencies pulled it in. Something you cannot
+  place is worth a minute.
+- **LOCAL CODE STANDING IN FOR A CRATE** means a `[patch]` replaces a
+  crates.io crate with code from the repo. Check that it is meant.
+
+An approval covers that exact file in every project on this machine. It does
+not travel to other machines, and nothing in a repository can grant one.
+
+### The other things that are yours
+
+| Command | What it does | Why it is yours |
+|---|---|---|
+| `rbox urgent NAME@VERSION` | pulls one version past the 7-day cooldown | a security fix cannot wait a week; a hijacked release looks the same |
+| `rbox net allow HOST:PORT` | lets `--net` tests and programs reach that host | a host on the list is a way out for data |
+| `rbox export NAME --to FOLDER` | copies a built program out of the box | from there it runs unboxed |
+
+Claude can run everything else, including `rbox sync` (download what the
+lockfile names), `rbox pending`, `rbox status` and `rbox --net cargo test`
+once a host is listed. If you see `[POLICY GUARD] Refused` in the watcher,
+Claude asked for one of the commands above or tried a way around them. Do the
+step yourself if you want it done.
+
+### What to keep an eye on
+
+- `UNVERIFIED` in the watcher means no Rust check has run since crates
+  started waiting. Do not accept "done" in that state.
+- A session that removes or swaps a dependency right after it was asked to
+  wait is working around you. The instruction it was given says not to.
+- `rbox net list` should stay short and specific. A general-purpose host
+  there (code hosting, paste sites, object storage) defeats the list.
+
+## 9. A note on what the operator does not do
 
 - Does not disable hooks to get past a block. The block is the harness
   working. Diagnose with `TROUBLESHOOTING.md`.
