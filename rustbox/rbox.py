@@ -259,10 +259,14 @@ def require_human(what: str) -> None:
 
 
 def ask(prompt: str) -> str:
-    """Read one line from the controlling terminal, never from stdin."""
-    with open("/dev/tty", "r+", encoding="utf-8", errors="replace") as tty:
-        tty.write(prompt)
-        tty.flush()
+    """Read one line from the controlling terminal, never from stdin.
+
+    Two handles, one to write and one to read: a terminal cannot seek, and
+    Python refuses to open one for both in text mode ("r+")."""
+    with open("/dev/tty", "w", encoding="utf-8") as out:
+        out.write(prompt)
+        out.flush()
+    with open("/dev/tty", "r", encoding="utf-8", errors="replace") as tty:
         return tty.readline().strip()
 
 

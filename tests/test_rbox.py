@@ -772,5 +772,43 @@ class SmallThings(unittest.TestCase):
         self.assertNotIn("environ.get(\"RBOX", source)
 
 
+class AskOnARealTerminal(unittest.TestCase):
+    """The other tests replace rbox.ask with canned answers, so they never open a
+    terminal. This one runs the real ask() with a pseudo-terminal as its controlling
+    terminal: the first `rbox allow` typed by a person crashed exactly here."""
+
+    def test_ask_prints_the_prompt_and_reads_the_answer(self):
+        import pty
+
+        read_end, write_end = os.pipe()
+        pid, master = pty.fork()
+        if pid == 0:  # the child: the pseudo-terminal is its /dev/tty
+            code = 1
+            try:
+                os.close(read_end)
+                os.write(write_end, ("answer=" + rbox.ask("Type yes: ")).encode())
+                code = 0
+            except BaseException as exc:  # report it, never fall back into the test runner
+                os.write(write_end, f"error={type(exc).__name__}: {exc}".encode())
+            finally:
+                os._exit(code)
+        os.close(write_end)
+        try:
+            shown = b""
+            while b"Type yes: " not in shown:
+                chunk = os.read(master, 1024)
+                if not chunk:
+                    break
+                shown += chunk
+            os.write(master, b"yes\n")
+            with os.fdopen(read_end, "rb") as result:
+                reported = result.read().decode()
+        finally:
+            os.waitpid(pid, 0)
+            os.close(master)
+        self.assertIn("Type yes: ", shown.decode())
+        self.assertEqual(reported, "answer=yes")
+
+
 if __name__ == "__main__":
     unittest.main()
